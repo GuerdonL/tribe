@@ -65,6 +65,28 @@ Every one of these was a stall or a bug found by watching episodes, and each is 
 - The predator must be slower than the learner or warnings arrive too late to matter.
 - Night must be short relative to day or thirst kills everyone before guidance can help. Day is 80 steps: 48 day, 12 dusk, 20 night.
 
-## Next: M1
+## M1: the learned agent
 
-Single learner, scripted adult, the transformer from the spec (GTrXL recipe), world-prediction loss + PPO. Pass: gaze-following above chance within hours on one GPU. First step is the JAX port of `world.py` and `frame.py`.
+Everything M0 did by hand, now learned. `tribe/jax_world.py` is the environment in JAX (batched, jit-able, same frame layout; the M0 policies run on its frames unchanged and reproduce the M0 effect: +33.6 steps, 95% CI [+20.6, +46.3]). `tribe/model.py` is the learner; `tribe/train.py` is PPO plus the prediction losses.
+
+**Model.** Each frame's 13 rows (self + 12 slots) are embedded field-by-field and mixed by one set-attention layer into a frame vector. A GTrXL-style decoder (gated residuals, pre-LN) runs over the last K frame vectors, each with the previous step's output added. Heads off the last position: policy (action, pointing, saying), value, and a next-frame predictor conditioned on the action taken that predicts every field of every row of the following frame. `heard_word` / `heard_dir` are two of those fields with their own loss weight, so word prediction is tracked separately. Nothing in the model knows what a word means.
+
+**Objectives.** `L = w_pi * PPO + w_world * CE(next frame) + w_heard * CE(next heard)`. Prediction losses train the trunk by backprop only; they never enter the advantage, so there is no dark-room incentive. Reward: +0.02 per step alive, +2 x any increase in hunger/thirst/warmth, -1 on death.
+
+**Pass criterion.** `gaze_follow_rate` in the log: among steps where a pointing adult is visible and faces the learner's left or right, the fraction of actions that are the matching turn, against `gaze_chance` (the learner's base rate of that turn). M1 passes when it is reliably above chance.
+
+```
+python -m pytest tests -q                       # 14 tests, ~1 min on CPU
+python scripts/m0_jax.py --envs 200             # M0 in the JAX world
+python scripts/m0_jax.py --bench                # env throughput
+python -m tribe.train --preset cpu              # smoke test: 32 envs, 300k params, ~2 s/update on 2 cores
+python -m tribe.train --preset gpu              # the M1 run: 2048 envs, d=256 x 6 layers, K=32
+```
+
+CPU smoke (150 updates, 150k agent-steps): world loss 52 -> 19, heard loss 4.7 -> 0.7, gaze at chance. That is the expected shape for a tiny model after minutes; the GPU preset is where M1 is decided. Logs go to `runs/<name>/log.csv`, checkpoints to `params.pkl`.
+
+**Install.** `pip install -e .[dev]`; for a GPU, install the matching `jax[cuda12]` wheel first.
+
+## Next
+
+M1 on a GPU. If gaze-following clears chance: M2 (tribe, rungs 2-3, shared weights, group-weighted reward). If not, the first suspects are reward scale (survival bonus dominating), prediction-loss weight, and whether the adult is in view often enough for the cue to matter at all; `gaze_cues` in the log says how often it is.
