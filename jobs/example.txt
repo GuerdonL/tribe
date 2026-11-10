@@ -1,0 +1,4 @@
+# one job per line: `name: command`. The command must write to runs/<name>.
+# python scripts/fleet.py launch jobs/example.txt --dry-run
+m1_s3: python -m tribe.train --preset gpu_xl --seed 3 --out runs/m1_s3 --snapshots 100,250,500,1000,2000,3000 --resume
+m1_s4: python -m tribe.train --preset gpu_xl --seed 4 --out runs/m1_s4 --snapshots 100,250,500,1000,2000,3000 --resume

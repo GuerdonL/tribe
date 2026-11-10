@@ -1,0 +1,7 @@
+# Pinned to what M1 was trained with (RTX 4090, CUDA 12 wheels). Used by scripts/worker.sh.
+jax[cuda12]==0.12.0.1
+flax==0.12.12
+optax==0.2.8
+numpy==2.5.4
+huggingface-hub==2.2.0
+vastai

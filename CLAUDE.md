@@ -43,6 +43,9 @@ tribe/model.py       Learner (windowed GTrXL), XLLearner (cached-memory GTrXL: s
 tribe/train.py       PPO + prediction losses, make_train (window) / make_train_xl, presets, resume, gaze metric.
 tribe/world.py, frame.py, adult.py, policies.py, episode.py   NumPy reference world and M0 (keep in sync with jax_world semantics; tests compare them)
 scripts/m0.py, m0_jax.py, replay.py, vast_setup.sh
+scripts/fleet.py     rent Vast.ai instances, one job per instance (launch / status / logs / collect / destroy)
+scripts/worker.sh, fleet_sync.py   what each instance runs; results go to a private Hugging Face repo
+scripts/evallib.py + *_eval.py     ablation, word, facing and per-snapshot evaluations of trained weights
 tests/               run `python -m pytest tests -q` (~1 min CPU) after any change
 ```
 
@@ -68,3 +71,12 @@ Fix before any M2 training:
   deaths. A night drains 0.57 warmth from 1.0 and the predator starts too far away to arrive. The shelter rung
   needs nights that cost something. Whether the reward term or the harmless night is what stops sheltering is untested.
 - Consequence: "home" and "here" are ignored by the learner, and the adult says "home" about 40% of each day.
+
+## Running on several instances
+
+`python scripts/fleet.py launch jobs/<file>.txt --dry-run` shows the instances and hourly cost; without `--dry-run`
+it asks, then rents. One job per instance, because a run cannot be split across machines and two runs sharing one
+GPU each go at half speed (measured: 3.5 s/update alone, about 8 s/update with two on one 4090). Jobs must write to
+`runs/<name>/`; that folder is uploaded to `<hf user>/tribe-runs` every 10 minutes and restored if the instance
+restarts. Instances destroy themselves on success and stop on failure. The launch commit must be pushed.
+Not yet exercised end to end on a rented instance (as of 2026-11-10): do a short smoke job first.
