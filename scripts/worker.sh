@@ -22,15 +22,19 @@ finish() {   # $1 = exit code of the job
     python scripts/fleet_sync.py push "$HF_REPO" "$NAME" --all --status "$1" --log "$LOG" || echo "[worker] final upload FAILED"
     if [ "$1" = "0" ] && [ "$ON_DONE" = "destroy" ]; then
         echo "[worker] done, destroying instance $CONTAINER_ID"
-        vastai destroy instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY" \
-            || vastai stop instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY"
+        # newer CLIs ask for confirmation (and exit 0 when it is not given), older ones have no --yes
+        vastai destroy instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY" --yes \
+            || echo y | vastai destroy instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY"
+        sleep 90   # a destroyed instance never gets here
+        echo "[worker] still alive after destroy, stopping instead"
+        vastai stop instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY"
     elif [ "$ON_DONE" != "keep" ]; then
         echo "[worker] stopping instance $CONTAINER_ID (exit code $1; disk kept for inspection)"
         vastai stop instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY"
     fi
 }
 
-[ -f /etc/environment ] && set -a && . /etc/environment && set +a
+[ -f /etc/environment ] && { set -a; . /etc/environment 2>/dev/null; set +a; }   # some lines are not valid shell
 [ -f /venv/main/bin/activate ] && source /venv/main/bin/activate
 cd /root
 if [ ! -d tribe/.git ]; then git clone -q "$REPO_URL" tribe || { echo "[worker] clone failed"; exit 1; }; fi

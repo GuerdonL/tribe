@@ -79,4 +79,5 @@ it asks, then rents. One job per instance, because a run cannot be split across 
 GPU each go at half speed (measured: 3.5 s/update alone, about 8 s/update with two on one 4090). Jobs must write to
 `runs/<name>/`; that folder is uploaded to `<hf user>/tribe-runs` every 10 minutes and restored if the instance
 restarts. Instances destroy themselves on success and stop on failure. The launch commit must be pushed.
-Not yet exercised end to end on a rented instance (as of 2026-11-10): do a short smoke job first.
+Exercised end to end once (2026-11-10, 20-update smoke job on a rented 4090: clone, install, train at about
+4 s/update, upload, self-destroy with the instance's own key). Restore-after-restart and the failure path (stop) are untested.
