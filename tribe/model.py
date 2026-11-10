@@ -274,7 +274,12 @@ class Predictor(nn.Module):
 
 
 def prediction_losses(self_logits, slot_logits, next_frame):
-    """Per-example cross-entropies: (world, heard). next_frame: (..., FRAME_LEN) ints."""
+    """Per-example cross-entropies: (world, heard, heard_spoken, spoken_mask).
+    next_frame: (..., FRAME_LEN) ints.
+
+    `heard` is the loss term (heard_word + heard_dir on every step). `heard_spoken` is the
+    heard_word CE only where the target is a real word, with `spoken_mask` marking those
+    steps; most steps are silence, so `heard` alone mostly measures predicting <none>."""
     me = next_frame[..., : S.SELF_LEN]
     slots = next_frame[..., S.SELF_LEN:].reshape(next_frame.shape[:-1] + (S.N_SLOTS, S.SLOT_LEN))
 
@@ -282,12 +287,17 @@ def prediction_losses(self_logits, slot_logits, next_frame):
         return -jnp.take_along_axis(jax.nn.log_softmax(logits, -1), target[..., None], -1)[..., 0]
 
     heard_idx = {S.SELF_FIELDS.index("heard_word"), S.SELF_FIELDS.index("heard_dir")}
+    word_k = S.SELF_FIELDS.index("heard_word")
     world = 0.0
     heard = 0.0
+    heard_spoken = 0.0
+    spoken_mask = (me[..., word_k] != S.NO_WORD).astype(jnp.float32)
     for k in range(S.SELF_LEN):
         l = ce(self_logits[k], me[..., k])
         if k in heard_idx:
             heard = heard + l
+            if k == word_k:
+                heard_spoken = l * spoken_mask
         else:
             world = world + l
     # slot fields: validity always; other fields only where the slot is valid in the target
@@ -298,4 +308,4 @@ def prediction_losses(self_logits, slot_logits, next_frame):
             world = world + l.sum(-1)
         else:
             world = world + (l * valid).sum(-1)
-    return world, heard
+    return world, heard, heard_spoken, spoken_mask

@@ -135,13 +135,17 @@ def ppo_loss(cfg, logits, predict_fn, out, old_logp, adv, ret, next_frame, has_n
     Ha, Hp, Hs = entropy_of(logits)
     ent = cfg.ent_action * Ha.mean() + cfg.ent_point * Hp.mean() + cfg.ent_say * Hs.mean()
     sl, ll = predict_fn(logits["h"], out)
-    world, heard = prediction_losses(sl, ll, next_frame)
+    world, heard, heard_spoken, spoken = prediction_losses(sl, ll, next_frame)
     m = has_next.astype(jnp.float32)
     world = (world * m).sum() / jnp.maximum(m.sum(), 1.0)
     heard = (heard * m).sum() / jnp.maximum(m.sum(), 1.0)
+    # metric only (not in the loss): word CE on steps where a word was actually heard
+    sm = spoken * m
+    heard_spoken = (heard_spoken * m).sum() / jnp.maximum(sm.sum(), 1.0)
     total = cfg.w_pi * (pg + cfg.vf_coef * vf - ent) + cfg.w_world * world + cfg.w_heard * heard
     approx_kl = ((ratio - 1) - jnp.log(ratio)).mean()
     return total, {"pg": pg, "vf": vf, "ent_action": Ha.mean(), "world": world, "heard": heard,
+                   "heard_spoken": heard_spoken, "spoken_frac": sm.sum() / jnp.maximum(m.sum(), 1.0),
                    "approx_kl": approx_kl, "clipfrac": (jnp.abs(ratio - 1) > cfg.clip).mean()}
 
 
@@ -526,7 +530,7 @@ def main():
         writer.writerow(m); fh.flush()
         if u % cfg.log_every == 0:
             print(f"u{u:5d} steps {m['steps']:>9,} | R/step {m['reward_per_step']:+.4f} deaths {int(m['deaths']):4d} "
-                  f"| world {m['world']:.3f} heard {m['heard']:.3f} pg {m['pg']:+.3f} vf {m['vf']:.3f} H {m['ent_action']:.2f} "
+                  f"| world {m['world']:.3f} heard {m['heard']:.3f} (spoken {m['heard_spoken']:.2f}, {m['spoken_frac']*100:.0f}%) pg {m['pg']:+.3f} vf {m['vf']:.3f} H {m['ent_action']:.2f} "
                   f"| gaze {m['gaze_follow_rate']:.2f} vs chance {m['gaze_chance']:.2f} (n={m['gaze_cues']}) "
                   f"| {m['elapsed_s']:.0f}s", flush=True)
         if u % cfg.ckpt_every == 0 or u == cfg.updates:

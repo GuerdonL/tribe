@@ -23,7 +23,8 @@ def test_forward_and_predict_shapes():
     sl, ll = p.apply(pp, out["h"], jnp.zeros((B, 3), jnp.int32))
     assert len(sl) == S.SELF_LEN and len(ll) == S.SLOT_LEN
     assert ll[1].shape == (B, S.N_SLOTS, S.N_TYPES)
-    world, heard = prediction_losses(sl, ll, frames[:, -1])
+    world, heard, heard_spoken, spoken = prediction_losses(sl, ll, frames[:, -1])
+    assert heard_spoken.shape == (B,) and spoken.shape == (B,)
     assert world.shape == (B,) and heard.shape == (B,)
     assert bool(jnp.isfinite(world).all()) and bool(jnp.isfinite(heard).all())
 
