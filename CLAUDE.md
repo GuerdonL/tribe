@@ -57,3 +57,14 @@ tests/               run `python -m pytest tests -q` (~1 min CPU) after any chan
 ## What comes after M1
 
 M2: a tribe (3-6 learners, shared weights), rungs 2-3 (intent reading via two-agent game, joint commitment via shelter convergence), group-weighted reward. The NumPy world already supports multiple learners; the JAX world's `n_learners` arg does too but is untested beyond 1. Mobile game that needs two agents is not implemented in either world yet.
+
+### M2 list (from the M1 follow-ups, 2026-11-10)
+
+Fix before any M2 training:
+- **Warmth reward pays for getting cold.** `world_step` rewards every positive meter change, including warmth
+  recovering each morning (about 0.57 warmth = 1.1 reward per day, from the constants; not measured). A sheltered
+  learner stays at full warmth and gets none of it. Pay for deficit avoided, not recovery.
+- **Nights are harmless.** Seed-0 final weights: sheltered on 0.0% of night steps, zero cold deaths, 0.2% predator
+  deaths. A night drains 0.57 warmth from 1.0 and the predator starts too far away to arrive. The shelter rung
+  needs nights that cost something. Whether the reward term or the harmless night is what stops sheltering is untested.
+- Consequence: "home" and "here" are ignored by the learner, and the adult says "home" about 40% of each day.
