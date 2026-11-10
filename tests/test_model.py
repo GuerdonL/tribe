@@ -57,3 +57,55 @@ def test_gaze_metric():
     frames[2, base:base + 7] = [1, S.ADULT, 0 + S.REL_X_OFFSET, 2, 3, 0, 0]
     m = gaze_metrics(frames, acts)
     assert m["gaze_cues"] == 2 and m["gaze_follow_rate"] == 1.0
+
+
+def _xl_rollout(m, lp, frames, outs, eps, mem, mem_ep, last_out):
+    """Run XLLearner.step over T positions; return stacked logits and the per-step inputs."""
+    from tribe.model import XLLearner
+    T = frames.shape[1]
+    acts, prev_outs, prev_sames = [], [], []
+    for t in range(T):
+        prev_same = mem_ep[:, -1] == eps[:, t]
+        o, mem = m.apply(lp, frames[:, t], last_out, prev_same, mem, mem_ep, eps[:, t], method=XLLearner.step)
+        acts.append(o["action"]); prev_outs.append(last_out); prev_sames.append(prev_same)
+        mem_ep = jnp.concatenate([mem_ep[:, 1:], eps[:, t:t + 1]], axis=1)
+        last_out = outs[:, t]
+    return jnp.stack(acts, 1), jnp.stack(prev_outs, 1), jnp.stack(prev_sames, 1), mem
+
+
+def test_xl_step_matches_sequence():
+    """The rollout (cached, one step at a time) and training (whole segment) passes agree,
+    including across an episode boundary and from a non-empty starting memory."""
+    from tribe.model import XLLearner
+    cfg = ModelConfig(d=32, n_layers=2, n_heads=2, K=4, arch="xl")
+    m = XLLearner(cfg)
+    B, T, L, K = 3, 9, cfg.n_layers, cfg.K
+    k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(0), 4)
+    frames = jax.random.randint(k1, (B, T, S.FRAME_LEN), 0, 2).astype(jnp.int32)
+    outs = jax.random.randint(k2, (B, T, 3), 0, 2).astype(jnp.int32)
+    eps = jnp.array([[0] * 9, [0] * 5 + [1] * 4, [0] * 2 + [1] * 7])
+    mem = 0.5 * jax.random.normal(k3, (B, L, K - 1, cfg.d))
+    mem_ep = jnp.array([[-1, 0, 0], [0, 0, 0], [-1, -1, 0]])
+    last_out = jnp.ones((B, 3), jnp.int32)
+    lp = m.init(k4, frames, outs, jnp.ones((B, T), bool), mem, mem_ep, eps)
+    a_step, prev_outs, prev_sames, _ = _xl_rollout(m, lp, frames, outs, eps, mem, mem_ep, last_out)
+    seq = m.apply(lp, frames, prev_outs, prev_sames, mem, mem_ep, eps, method=XLLearner.sequence)
+    assert np.allclose(np.asarray(a_step), np.asarray(seq["action"]), atol=1e-4)
+
+
+def test_xl_memory_from_other_episode_is_ignored():
+    from tribe.model import XLLearner
+    cfg = ModelConfig(d=32, n_layers=2, n_heads=2, K=4, arch="xl")
+    m = XLLearner(cfg)
+    B, T = 2, 3
+    key = jax.random.PRNGKey(1)
+    frames = jax.random.randint(key, (B, T, S.FRAME_LEN), 0, 2).astype(jnp.int32)
+    outs = jnp.zeros((B, T, 3), jnp.int32)
+    same = jnp.array([[False, True, True]] * B)
+    eps = jnp.ones((B, T), jnp.int32)
+    mem_ep = jnp.zeros((B, cfg.K - 1), jnp.int32)          # all from episode 0
+    mem_a = jax.random.normal(key, (B, cfg.n_layers, cfg.K - 1, cfg.d))
+    lp = m.init(key, frames, outs, same, mem_a, mem_ep, eps)
+    a = m.apply(lp, frames, outs, same, mem_a, mem_ep, eps)["action"]
+    b = m.apply(lp, frames, outs, same, 3.0 * mem_a + 1.0, mem_ep, eps)["action"]
+    assert np.allclose(np.asarray(a), np.asarray(b), atol=1e-5)

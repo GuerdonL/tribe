@@ -27,7 +27,7 @@ import optax
 
 from . import schema as S
 from . import jax_world as J
-from .model import Learner, Predictor, ModelConfig, prediction_losses
+from .model import Learner, XLLearner, Predictor, ModelConfig, prediction_losses
 
 
 # ------------------------------------------------------------- config ---
@@ -67,12 +67,96 @@ PRESETS = {
     # memory scales with (n_envs * T / minibatches) * K: 128 minibatches -> 1024 windows of 32 frames
     "gpu": TrainConfig(model=ModelConfig(d=256, n_layers=6, n_heads=8, K=32), n_envs=2048, T=64,
                        epochs=3, minibatches=128, updates=3000, lr=2e-4, out_dir="runs/m1_gpu"),
+    # XL memory (see make_train_xl): each frame is encoded once per pass instead of K times.
+    # minibatches split envs; 32 -> 64 envs x 64 steps = 4096 samples per gradient step.
+    "cpu_xl": TrainConfig(model=ModelConfig(d=64, n_layers=2, n_heads=4, K=8, arch="xl", remat=False),
+                          n_envs=32, T=32, epochs=2, minibatches=4, updates=60, out_dir="runs/m1_cpu_xl"),
+    "gpu_xl": TrainConfig(model=ModelConfig(d=256, n_layers=6, n_heads=8, K=32, arch="xl", remat=False),
+                          n_envs=2048, T=64, epochs=3, minibatches=32, updates=3000, lr=2e-4,
+                          out_dir="runs/m1_gpu_xl"),
 }
 
 # reward shaping
 R_ALIVE = 0.02
 R_NEED = 2.0
 R_DEATH = -1.0
+
+
+def world_step(env, out, key):
+    """Learner output (N, 3) + scripted adult -> (next env with auto-reset, reward, done)."""
+    N = out.shape[0]
+    aa, ap, asay = jax.vmap(J.adult_act, in_axes=(0, None))(env, 1)
+    acts = jnp.stack([out[:, 0], aa], axis=1)
+    pts = jnp.stack([out[:, 1], ap.astype(jnp.int32)], axis=1)
+    says = jnp.stack([out[:, 2], asay], axis=1)
+    before = (env.hunger[:, 0], env.thirst[:, 0], env.warmth[:, 0])
+    env2 = jax.vmap(J.step)(env, acts, pts, says)
+    gains = sum(jnp.maximum(a2 - a1, 0.0) for a1, a2 in zip(before, (env2.hunger[:, 0], env2.thirst[:, 0], env2.warmth[:, 0])))
+    died = env2.died_this_step[:, 0]
+    reward = R_ALIVE * env2.alive[:, 0] + R_NEED * gains + R_DEATH * died
+    done = died | (env2.t >= S.EPISODE_STEPS)
+    fresh = J.reset_batch(jax.random.split(key, N), 1, 1)
+    env3 = jax.tree.map(lambda a, b: jnp.where(done.reshape((-1,) + (1,) * (a.ndim - 1)), b, a), env2, fresh)
+    return env3, reward, done
+
+
+def logp_of(logits, out):
+    """logits leaves (M, n); out (M, 3) -> (M,)"""
+    la = jax.nn.log_softmax(logits["action"])[jnp.arange(out.shape[0]), out[:, 0]]
+    lp = jax.nn.log_softmax(logits["pointing"])[jnp.arange(out.shape[0]), out[:, 1]]
+    ls = jax.nn.log_softmax(logits["saying"])[jnp.arange(out.shape[0]), out[:, 2]]
+    return la + lp + ls
+
+
+def entropy_of(logits):
+    def H(l):
+        p = jax.nn.softmax(l)
+        return -(p * jax.nn.log_softmax(l)).sum(-1)
+    return H(logits["action"]), H(logits["pointing"]), H(logits["saying"])
+
+
+def sample_out(key, logits):
+    k1, k2, k3 = jax.random.split(key, 3)
+    a = jax.random.categorical(k1, logits["action"])
+    p = jax.random.categorical(k2, logits["pointing"])
+    s = jax.random.categorical(k3, logits["saying"])
+    out = jnp.stack([a, p, s], axis=-1).astype(jnp.int32)
+    return out, logp_of(logits, out)
+
+
+def ppo_loss(cfg, logits, predict_fn, out, old_logp, adv, ret, next_frame, has_next):
+    """Shared PPO + prediction loss over flat (M, ...) samples. Prediction losses reach the
+    trunk only through backprop; they never enter the advantage."""
+    logp = logp_of(logits, out)
+    ratio = jnp.exp(logp - old_logp)
+    adv_n = (adv - adv.mean()) / (adv.std() + 1e-8)
+    pg = -jnp.minimum(ratio * adv_n, jnp.clip(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv_n).mean()
+    vf = 0.5 * ((logits["value"] - ret) ** 2).mean()
+    Ha, Hp, Hs = entropy_of(logits)
+    ent = cfg.ent_action * Ha.mean() + cfg.ent_point * Hp.mean() + cfg.ent_say * Hs.mean()
+    sl, ll = predict_fn(logits["h"], out)
+    world, heard = prediction_losses(sl, ll, next_frame)
+    m = has_next.astype(jnp.float32)
+    world = (world * m).sum() / jnp.maximum(m.sum(), 1.0)
+    heard = (heard * m).sum() / jnp.maximum(m.sum(), 1.0)
+    total = cfg.w_pi * (pg + cfg.vf_coef * vf - ent) + cfg.w_world * world + cfg.w_heard * heard
+    approx_kl = ((ratio - 1) - jnp.log(ratio)).mean()
+    return total, {"pg": pg, "vf": vf, "ent_action": Ha.mean(), "world": world, "heard": heard,
+                   "approx_kl": approx_kl, "clipfrac": (jnp.abs(ratio - 1) > cfg.clip).mean()}
+
+
+def gae(cfg, trs, last_value):
+    """trs.reward/value/done: (T, N). Returns (advantages, returns), both (T, N)."""
+    def body(carry, x):
+        adv_next, v_next = carry
+        r, v, d = x
+        nonterm = 1.0 - d.astype(jnp.float32)
+        delta = r + cfg.gamma * v_next * nonterm - v
+        adv = delta + cfg.gamma * cfg.lam * nonterm * adv_next
+        return (adv, v), adv
+    _, advs = jax.lax.scan(body, (jnp.zeros_like(last_value), last_value),
+                           (trs.reward, trs.value, trs.done), reverse=True)
+    return advs, advs + trs.value
 
 
 # ------------------------------------------------------------ runner ---
@@ -138,26 +222,6 @@ def make_train(cfg: TrainConfig):
         valid = eps == ep[:, None]
         return frames, prev_out, valid
 
-    def sample_out(key, logits):
-        k1, k2, k3 = jax.random.split(key, 3)
-        a = jax.random.categorical(k1, logits["action"])
-        p = jax.random.categorical(k2, logits["pointing"])
-        s = jax.random.categorical(k3, logits["saying"])
-        out = jnp.stack([a, p, s], axis=-1).astype(jnp.int32)
-        return out, logp_of(logits, out)
-
-    def logp_of(logits, out):
-        la = jax.nn.log_softmax(logits["action"])[jnp.arange(out.shape[0]), out[:, 0]]
-        lp = jax.nn.log_softmax(logits["pointing"])[jnp.arange(out.shape[0]), out[:, 1]]
-        ls = jax.nn.log_softmax(logits["saying"])[jnp.arange(out.shape[0]), out[:, 2]]
-        return la + lp + ls
-
-    def entropy_of(logits):
-        def H(l):
-            p = jax.nn.softmax(l)
-            return -(p * jax.nn.log_softmax(l)).sum(-1)
-        return H(logits["action"]), H(logits["pointing"]), H(logits["saying"])
-
     def env_step(rs: RunnerState, params):
         env = rs.env
         frame = jax.vmap(J.observe, in_axes=(0, None))(env, 0)                     # learner frames (N, F)
@@ -165,19 +229,7 @@ def make_train(cfg: TrainConfig):
         logits = forward(params, frames, prev_out, valid)
         key, k_s, k_r = jax.random.split(rs.key, 3)
         out, logp = sample_out(k_s, logits)
-        aa, ap, asay = jax.vmap(J.adult_act, in_axes=(0, None))(env, 1)
-        acts = jnp.stack([out[:, 0], aa], axis=1)
-        pts = jnp.stack([out[:, 1], ap.astype(jnp.int32)], axis=1)
-        says = jnp.stack([out[:, 2], asay], axis=1)
-        before = (env.hunger[:, 0], env.thirst[:, 0], env.warmth[:, 0])
-        env2 = jax.vmap(J.step)(env, acts, pts, says)
-        gains = sum(jnp.maximum(a2 - a1, 0.0) for a1, a2 in zip(before, (env2.hunger[:, 0], env2.thirst[:, 0], env2.warmth[:, 0])))
-        died = env2.died_this_step[:, 0]
-        reward = R_ALIVE * env2.alive[:, 0] + R_NEED * gains + R_DEATH * died
-        done = died | (env2.t >= S.EPISODE_STEPS)
-        # auto-reset
-        fresh = J.reset_batch(jax.random.split(k_r, N), 1, 1)
-        env3 = jax.tree.map(lambda a, b: jnp.where(done.reshape((-1,) + (1,) * (a.ndim - 1)), b, a), env2, fresh)
+        env3, reward, done = world_step(env, out, k_r)
         # buffers: push this frame/out, then advance episode id where done
         buf_frames = jnp.concatenate([rs.buf_frames[:, 1:], frame[:, None]], axis=1)
         buf_out = jnp.concatenate([rs.buf_out[:, 1:], out[:, None]], axis=1)
@@ -197,18 +249,6 @@ def make_train(cfg: TrainConfig):
         last_value = forward(params, frames, prev_out, valid)["value"]
         return rs, trs, init_buf, last_frame, last_value
 
-    def gae(trs: Transition, last_value):
-        def body(carry, x):
-            adv_next, v_next = carry
-            r, v, d = x
-            nonterm = 1.0 - d.astype(jnp.float32)
-            delta = r + cfg.gamma * v_next * nonterm - v
-            adv = delta + cfg.gamma * cfg.lam * nonterm * adv_next
-            return (adv, v), adv
-        _, advs = jax.lax.scan(body, (jnp.zeros_like(last_value), last_value),
-                               (trs.reward, trs.value, trs.done), reverse=True)
-        return advs, advs + trs.value
-
     def build_windows(seq_frames, seq_out, seq_ep, n_idx, t_idx):
         """seq_*: (N, K-1+T+1, ...) ; sample (n, t) -> window ending at rollout step t."""
         ar = jnp.arange(K)
@@ -223,27 +263,13 @@ def make_train(cfg: TrainConfig):
     def loss_fn(params, batch):
         frames, prev_out, valid, out, old_logp, adv, ret, next_frame, has_next = batch
         logits = forward(params, frames, prev_out, valid)
-        logp = logp_of(logits, out)
-        ratio = jnp.exp(logp - old_logp)
-        adv_n = (adv - adv.mean()) / (adv.std() + 1e-8)
-        pg = -jnp.minimum(ratio * adv_n, jnp.clip(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv_n).mean()
-        vf = 0.5 * ((logits["value"] - ret) ** 2).mean()
-        Ha, Hp, Hs = entropy_of(logits)
-        ent = cfg.ent_action * Ha.mean() + cfg.ent_point * Hp.mean() + cfg.ent_say * Hs.mean()
-        sl, ll = predict(params, logits["h"], out)
-        world, heard = prediction_losses(sl, ll, next_frame)
-        m = has_next.astype(jnp.float32)
-        world = (world * m).sum() / jnp.maximum(m.sum(), 1.0)
-        heard = (heard * m).sum() / jnp.maximum(m.sum(), 1.0)
-        total = cfg.w_pi * (pg + cfg.vf_coef * vf - ent) + cfg.w_world * world + cfg.w_heard * heard
-        approx_kl = ((ratio - 1) - jnp.log(ratio)).mean()
-        return total, {"pg": pg, "vf": vf, "ent_action": Ha.mean(), "world": world, "heard": heard,
-                       "approx_kl": approx_kl, "clipfrac": (jnp.abs(ratio - 1) > cfg.clip).mean()}
+        return ppo_loss(cfg, logits, lambda h, o: predict(params, h, o), out, old_logp, adv, ret,
+                        next_frame, has_next)
 
     @jax.jit
     def update(params, opt_state, rs):
         rs, trs, init_buf, last_frame, last_value = rollout(rs, params)
-        adv, ret = gae(trs, last_value)
+        adv, ret = gae(cfg, trs, last_value)
         # per-env sequences: [buffer (K-1)] + [rollout T] + [frame after]
         seq_frames = jnp.concatenate([init_buf[0], jnp.swapaxes(trs.frame, 0, 1), last_frame[:, None]], axis=1)
         seq_out = jnp.concatenate([init_buf[1], jnp.swapaxes(trs.out, 0, 1), jnp.zeros((N, 1, 3), jnp.int32)], axis=1)
@@ -268,6 +294,128 @@ def make_train(cfg: TrainConfig):
                 next_frame = seq_frames[n_idx, t_idx + K]        # frame after step t
                 batch = (frames, prev_out, valid, out_flat[idx], logp_flat[idx], adv_flat[idx],
                          ret_flat[idx], next_frame, has_next[idx])
+                (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch)
+                upd, opt_state = tx.update(grads, opt_state, params)
+                params = optax.apply_updates(params, upd)
+                aux["loss"] = loss
+                return (params, opt_state), aux
+            (params, opt_state), auxs = jax.lax.scan(mini, (params, opt_state), mb)
+            return (params, opt_state, key), jax.tree.map(jnp.mean, auxs)
+
+        (params, opt_state, key), auxs = jax.lax.scan(epoch, (params, opt_state, rs.key), None, length=cfg.epochs)
+        rs = rs._replace(key=key)
+        metrics = jax.tree.map(jnp.mean, auxs)
+        metrics["reward_per_step"] = trs.reward.mean()
+        metrics["episodes_ended"] = trs.done.sum()
+        metrics["deaths"] = (trs.reward <= R_DEATH + 1e-6).sum()
+        return params, opt_state, rs, trs, metrics
+
+    return init_params, tx, reset_runner, update
+
+
+# ---------------------------------------------------------- XL runner ---
+class XLRunnerState(NamedTuple):
+    env: J.EnvState                # batched
+    mem: jnp.ndarray               # (N, n_layers, K-1, d) layer inputs at the previous K-1 positions
+    mem_ep: jnp.ndarray            # (N, K-1) their episode ids (-1 = empty)
+    last_out: jnp.ndarray          # (N, 3) output taken at the previous position
+    ep_id: jnp.ndarray             # (N,)
+    key: jnp.ndarray
+
+
+class XLTransition(NamedTuple):
+    frame: jnp.ndarray             # (N, F)
+    out: jnp.ndarray               # (N, 3)
+    prev_out: jnp.ndarray          # (N, 3)   model input: output at the previous position
+    prev_same: jnp.ndarray         # (N,)     previous position is in this episode
+    ep: jnp.ndarray                # (N,)
+    logp: jnp.ndarray
+    value: jnp.ndarray
+    reward: jnp.ndarray
+    done: jnp.ndarray
+
+
+def make_train_xl(cfg: TrainConfig):
+    """Same PPO + prediction objective as make_train, with XLLearner: the rollout encodes one
+    frame per step against cached per-layer memory, and training runs each env's whole
+    segment once (minibatches are groups of envs) instead of rebuilding a K-frame window
+    per sample. The training pass reproduces the rollout's computation exactly, so the
+    first minibatch has ratio 1."""
+    mcfg = cfg.model
+    K, N, T, F, L, d = mcfg.K, cfg.n_envs, cfg.T, S.FRAME_LEN, mcfg.n_layers, mcfg.d
+    assert N % cfg.minibatches == 0, "xl minibatches split envs: n_envs must divide evenly"
+    model = XLLearner(mcfg)
+    predictor = Predictor(mcfg)
+
+    def init_params(key):
+        k1, k2 = jax.random.split(key)
+        lp = model.init(k1, jnp.zeros((1, 2, F), jnp.int32), jnp.zeros((1, 2, 3), jnp.int32),
+                        jnp.ones((1, 2), bool), jnp.zeros((1, L, K - 1, d)),
+                        jnp.full((1, K - 1), -1, jnp.int32), jnp.zeros((1, 2), jnp.int32))
+        pp = predictor.init(k2, jnp.zeros((1, d)), jnp.zeros((1, 3), jnp.int32))
+        return {"learner": lp, "predictor": pp}
+
+    tx = optax.chain(optax.clip_by_global_norm(cfg.max_grad_norm), optax.adam(cfg.lr, eps=1e-5))
+
+    def reset_runner(key):
+        k1, k2 = jax.random.split(key)
+        return XLRunnerState(
+            env=J.reset_batch(jax.random.split(k1, N), 1, 1),
+            mem=jnp.zeros((N, L, K - 1, d), jnp.float32),
+            mem_ep=jnp.full((N, K - 1), -1, jnp.int32),
+            last_out=jnp.zeros((N, 3), jnp.int32),
+            ep_id=jnp.zeros((N,), jnp.int32),
+            key=k2,
+        )
+
+    def policy_step(params, rs, frame):
+        prev_same = rs.mem_ep[:, -1] == rs.ep_id
+        logits, new_mem = model.apply(params["learner"], frame, rs.last_out, prev_same, rs.mem,
+                                      rs.mem_ep, rs.ep_id, method=XLLearner.step)
+        return logits, new_mem, prev_same
+
+    def env_step(rs: XLRunnerState, params):
+        frame = jax.vmap(J.observe, in_axes=(0, None))(rs.env, 0)
+        logits, new_mem, prev_same = policy_step(params, rs, frame)
+        key, k_s, k_r = jax.random.split(rs.key, 3)
+        out, logp = sample_out(k_s, logits)
+        env3, reward, done = world_step(rs.env, out, k_r)
+        mem_ep = jnp.concatenate([rs.mem_ep[:, 1:], rs.ep_id[:, None]], axis=1)
+        tr = XLTransition(frame=frame, out=out, prev_out=rs.last_out, prev_same=prev_same, ep=rs.ep_id,
+                          logp=logp, value=logits["value"], reward=reward, done=done)
+        return XLRunnerState(env3, new_mem, mem_ep, out, rs.ep_id + done.astype(jnp.int32), key), tr
+
+    def loss_fn(params, batch):
+        frames, prev_out, prev_same, mem, mem_ep, eps, out, old_logp, adv, ret, next_frame, has_next = batch
+        logits = model.apply(params["learner"], frames, prev_out, prev_same, mem, mem_ep, eps,
+                             method=XLLearner.sequence)
+        flat = lambda x: x.reshape((-1,) + x.shape[2:])
+        logits = jax.tree.map(flat, logits)
+        return ppo_loss(cfg, logits, lambda h, o: predictor.apply(params["predictor"], h, o),
+                        flat(out), flat(old_logp), flat(adv), flat(ret), flat(next_frame), flat(has_next))
+
+    @jax.jit
+    def update(params, opt_state, rs):
+        mem0, mem_ep0 = rs.mem, rs.mem_ep
+        rs, trs = jax.lax.scan(lambda r, _: env_step(r, params), rs, None, length=T)
+        last_frame = jax.vmap(J.observe, in_axes=(0, None))(rs.env, 0)
+        last_value = policy_step(params, rs, last_frame)[0]["value"]
+        adv, ret = gae(cfg, trs, last_value)
+        # per-env sequences (N, T, ...)
+        sw = lambda x: jnp.swapaxes(x, 0, 1)
+        frames, out, eps = sw(trs.frame), sw(trs.out), sw(trs.ep)
+        next_frame = jnp.concatenate([frames[:, 1:], last_frame[:, None]], axis=1)
+        data = (frames, sw(trs.prev_out), sw(trs.prev_same), mem0, mem_ep0, eps, out, sw(trs.logp),
+                sw(adv), sw(ret), next_frame, sw(~trs.done))
+
+        def epoch(carry, _):
+            params, opt_state, key = carry
+            key, k = jax.random.split(key)
+            mb = jax.random.permutation(k, N).reshape(cfg.minibatches, -1)
+
+            def mini(carry, idx):
+                params, opt_state = carry
+                batch = jax.tree.map(lambda x: x[idx], data)
                 (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch)
                 upd, opt_state = tx.update(grads, opt_state, params)
                 params = optax.apply_updates(params, upd)
@@ -318,6 +466,7 @@ def main():
     ap.add_argument("--resume", action="store_true", help="continue from <out>/ckpt.pkl if present")
     ap.add_argument("--minibatches", type=int, default=None, help="more = smaller minibatches = less GPU memory")
     ap.add_argument("--envs", type=int, default=None)
+    ap.add_argument("--remat", action="store_true", help="gradient checkpointing (xl presets default off)")
     args = ap.parse_args()
     cfg = PRESETS[args.preset]
     if args.updates:
@@ -328,12 +477,17 @@ def main():
         cfg = dataclasses.replace(cfg, minibatches=args.minibatches)
     if args.envs:
         cfg = dataclasses.replace(cfg, n_envs=args.envs)
+    if args.remat:
+        cfg = dataclasses.replace(cfg, model=dataclasses.replace(cfg.model, remat=True))
     cfg = dataclasses.replace(cfg, seed=args.seed)
     mb = cfg.n_envs * cfg.T // cfg.minibatches
-    print(f"minibatch = {mb} windows x {cfg.model.K} frames (memory scales with this product)", flush=True)
+    if cfg.model.arch == "xl":
+        print(f"minibatch = {cfg.n_envs // cfg.minibatches} envs x {cfg.T} steps = {mb} samples (xl memory)", flush=True)
+    else:
+        print(f"minibatch = {mb} windows x {cfg.model.K} frames (memory scales with this product)", flush=True)
     os.makedirs(cfg.out_dir, exist_ok=True)
 
-    init_params, tx, reset_runner, update = make_train(cfg)
+    init_params, tx, reset_runner, update = (make_train_xl if cfg.model.arch == "xl" else make_train)(cfg)
     key = jax.random.PRNGKey(cfg.seed)
     k_p, k_r = jax.random.split(key)
     params = init_params(k_p)

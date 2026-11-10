@@ -32,6 +32,7 @@ class ModelConfig:
     mlp_mult: int = 4
     dropout: float = 0.0
     remat: bool = True           # gradient checkpointing: ~3x less activation memory, ~30% slower
+    arch: str = "window"         # "window": Learner, re-encodes K frames per sample; "xl": XLLearner, cached memory
 
 
 SELF_CARD = tuple(S.SELF_CARD)
@@ -158,6 +159,100 @@ class Learner(nn.Module):
         pi_say = nn.Dense(S.N_WORDS, name="pi_say")(hl)
         value = nn.Dense(1, name="value")(hl)[..., 0]
         return {"action": pi_action, "pointing": pi_point, "saying": pi_say, "value": value, "h": hl, "h_all": h}
+
+
+# ---------------------------------------------------------------- XL ---
+# Transformer-XL style learner. Same frame encoder, gating and heads as Learner, but
+# position is a learned relative bias over distance 0..K-1 and context is a per-layer
+# memory: layer l at position i attends to layer-l inputs at positions i-K+1..i of the
+# same episode. The rollout runs it one step at a time with cached memory (`step`);
+# training runs a whole rollout segment at once from the memory cached at its start
+# (`sequence`). Both compute the same function, so PPO's old_logp is exact.
+
+class XLBlock(nn.Module):
+    d: int
+    n_heads: int
+    mlp_mult: int
+    K: int
+
+    @nn.compact
+    def __call__(self, xq, xkv, mask, dist):
+        """xq (B,Q,d) queries; xkv (B,S,d) keys/values (memory + xq); mask (B,Q,S) bool;
+        dist (Q,S) int in [0, K-1]: query position minus key position."""
+        H = self.n_heads
+        dh = self.d // H
+        ln = nn.LayerNorm(name="ln_attn")
+        hq, hk = ln(xq), ln(xkv)
+        q = nn.DenseGeneral((H, dh), name="q")(hq)
+        k = nn.DenseGeneral((H, dh), name="k")(hk)
+        v = nn.DenseGeneral((H, dh), name="v")(hk)
+        bias = self.param("rel_bias", nn.initializers.zeros, (H, self.K))
+        logits = jnp.einsum("bqhd,bshd->bhqs", q, k) / jnp.sqrt(dh).astype(q.dtype) + bias[:, dist][None]
+        logits = jnp.where(mask[:, None], logits, jnp.finfo(logits.dtype).min)
+        a = jnp.einsum("bhqs,bshd->bqhd", jax.nn.softmax(logits, -1), v)
+        a = nn.DenseGeneral(self.d, axis=(-2, -1), name="o")(a)
+        x = GRUGate(self.d, name="gate_attn")(xq, nn.relu(a))
+        h = nn.LayerNorm(name="ln_mlp")(x)
+        m = nn.Dense(self.d, name="mlp_out")(nn.gelu(nn.Dense(self.d * self.mlp_mult, name="mlp_in")(h)))
+        return GRUGate(self.d, name="gate_mlp")(x, nn.relu(m))
+
+
+class XLLearner(nn.Module):
+    """mem: (B, n_layers, K-1, d) layer inputs at the K-1 previous positions, oldest first.
+    mem_ep: (B, K-1) their episode ids (-1 = empty). prev_out/prev_same: the output taken at
+    the previous position and whether that position is in the same episode."""
+    cfg: ModelConfig
+
+    def setup(self):
+        c = self.cfg
+        self.frame = FrameEncoder(c)
+        self.prev_out_embed = FieldEmbed(OUT_CARD, c.d)
+        Blk = nn.remat(XLBlock) if c.remat else XLBlock
+        self.blocks = [Blk(c.d, c.n_heads, c.mlp_mult, c.K) for _ in range(c.n_layers)]
+        self.ln_f = nn.LayerNorm()
+        self.pi_action = nn.Dense(S.N_ACTIONS)
+        self.pi_point = nn.Dense(2)
+        self.pi_say = nn.Dense(S.N_WORDS)
+        self.value = nn.Dense(1)
+
+    def _embed(self, frames, prev_out, prev_same):
+        po = self.prev_out_embed(prev_out) * prev_same[..., None].astype(jnp.float32)
+        return self.frame(frames) + po
+
+    def _heads(self, x):
+        h = self.ln_f(x)
+        return {"action": self.pi_action(h), "pointing": self.pi_point(h), "saying": self.pi_say(h),
+                "value": self.value(h)[..., 0], "h": h}
+
+    def step(self, frame, prev_out, prev_same, mem, mem_ep, ep):
+        """One position per env. frame (B,F); returns (outputs for this position, new mem)."""
+        K = self.cfg.K
+        x = self._embed(frame, prev_out, prev_same)[:, None]                         # (B,1,d)
+        mask = jnp.concatenate([mem_ep == ep[:, None], jnp.ones_like(ep[:, None], bool)], 1)[:, None]
+        dist = jnp.arange(K - 1, -1, -1)[None]                                       # (1,K)
+        new_mem = []
+        for l, blk in enumerate(self.blocks):
+            new_mem.append(jnp.concatenate([mem[:, l, 1:], x], axis=1))
+            x = blk(x, jnp.concatenate([mem[:, l], x], axis=1), mask, dist)
+        return self._heads(x[:, 0]), jnp.stack(new_mem, axis=1)
+
+    def sequence(self, frames, prev_out, prev_same, mem, mem_ep, eps):
+        """T consecutive positions per env starting after mem. frames (B,T,F), eps (B,T).
+        Memory is treated as fixed input (no gradient), as in the rollout that produced it."""
+        K = self.cfg.K
+        T = frames.shape[1]
+        x = self._embed(frames, prev_out, prev_same)                                 # (B,T,d)
+        kv_ep = jnp.concatenate([mem_ep, eps], axis=1)                                # (B,K-1+T)
+        dist = (K - 1 + jnp.arange(T))[:, None] - jnp.arange(K - 1 + T)[None]        # (T,K-1+T)
+        mask = ((dist >= 0) & (dist < K))[None] & (kv_ep[:, None, :] == eps[:, :, None])
+        dist = jnp.clip(dist, 0, K - 1)
+        mem = jax.lax.stop_gradient(mem)
+        for l, blk in enumerate(self.blocks):
+            x = blk(x, jnp.concatenate([mem[:, l], x], axis=1), mask, dist)
+        return self._heads(x)
+
+    def __call__(self, *args):
+        return self.sequence(*args)
 
 
 class Predictor(nn.Module):
