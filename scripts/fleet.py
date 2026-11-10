@@ -138,10 +138,13 @@ def cmd_launch(a):
             if isinstance(r, dict) and r.get("success"):
                 print(f"  {name}: instance {r.get('new_contract')} on offer {o['id']}")
                 break
+            if re.search(r"\b40[13]\b|Authorization|lacks", str(r)):
+                sys.exit(f"  {name}: this Vast API key is not allowed to rent instances: {r}\n"
+                         "  Log in with an account key that has instance-create permission (`vastai set api-key <key>`).")
             if not spare:
-                print(f"  {name}: FAILED to rent ({r}); no offers left")
+                print(f"  {name}: FAILED to rent, no offers left. Last error: {r}")
                 break
-            print(f"  {name}: offer {o['id']} was not available, trying the next one")
+            print(f"  {name}: offer {o['id']} failed ({str(r)[:120]}), trying the next one")
             o = spare.pop(0)
 
 
