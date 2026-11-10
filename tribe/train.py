@@ -55,6 +55,7 @@ class TrainConfig:
     log_every: int = 1
     ckpt_every: int = 50
     out_dir: str = "runs/m1"
+    snapshots: tuple = ()          # updates at which to keep a copy of the params (snap/u<update>.pkl)
 
 
 PRESETS = {
@@ -82,9 +83,8 @@ R_NEED = 2.0
 R_DEATH = -1.0
 
 
-def world_step(env, out, key):
-    """Learner output (N, 3) + scripted adult -> (next env with auto-reset, reward, done)."""
-    N = out.shape[0]
+def world_step_raw(env, out):
+    """Learner output (N, 3) + scripted adult -> (next env before any reset, reward, done)."""
     aa, ap, asay = jax.vmap(J.adult_act, in_axes=(0, None))(env, 1)
     acts = jnp.stack([out[:, 0], aa], axis=1)
     pts = jnp.stack([out[:, 1], ap.astype(jnp.int32)], axis=1)
@@ -95,6 +95,13 @@ def world_step(env, out, key):
     died = env2.died_this_step[:, 0]
     reward = R_ALIVE * env2.alive[:, 0] + R_NEED * gains + R_DEATH * died
     done = died | (env2.t >= S.EPISODE_STEPS)
+    return env2, reward, done
+
+
+def world_step(env, out, key):
+    """world_step_raw, then auto-reset the environments whose episode ended."""
+    N = out.shape[0]
+    env2, reward, done = world_step_raw(env, out)
     fresh = J.reset_batch(jax.random.split(key, N), 1, 1)
     env3 = jax.tree.map(lambda a, b: jnp.where(done.reshape((-1,) + (1,) * (a.ndim - 1)), b, a), env2, fresh)
     return env3, reward, done
@@ -467,6 +474,10 @@ def main():
     ap.add_argument("--minibatches", type=int, default=None, help="more = smaller minibatches = less GPU memory")
     ap.add_argument("--envs", type=int, default=None)
     ap.add_argument("--remat", action="store_true", help="gradient checkpointing (xl presets default off)")
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--K", type=int, default=None, help="frames of context")
+    ap.add_argument("--snapshots", type=str, default=None,
+                    help="comma-separated updates at which to keep params in <out>/snap/")
     args = ap.parse_args()
     cfg = PRESETS[args.preset]
     if args.updates:
@@ -479,6 +490,12 @@ def main():
         cfg = dataclasses.replace(cfg, n_envs=args.envs)
     if args.remat:
         cfg = dataclasses.replace(cfg, model=dataclasses.replace(cfg.model, remat=True))
+    if args.K:
+        cfg = dataclasses.replace(cfg, model=dataclasses.replace(cfg.model, K=args.K))
+    if args.lr is not None:
+        cfg = dataclasses.replace(cfg, lr=args.lr)
+    if args.snapshots:
+        cfg = dataclasses.replace(cfg, snapshots=tuple(int(x) for x in args.snapshots.split(",")))
     cfg = dataclasses.replace(cfg, seed=args.seed)
     mb = cfg.n_envs * cfg.T // cfg.minibatches
     if cfg.model.arch == "xl":
@@ -529,6 +546,10 @@ def main():
                   f"| world {m['world']:.3f} heard {m['heard']:.3f} pg {m['pg']:+.3f} vf {m['vf']:.3f} H {m['ent_action']:.2f} "
                   f"| gaze {m['gaze_follow_rate']:.2f} vs chance {m['gaze_chance']:.2f} (n={m['gaze_cues']}) "
                   f"| {m['elapsed_s']:.0f}s", flush=True)
+        if u in cfg.snapshots:
+            os.makedirs(os.path.join(cfg.out_dir, "snap"), exist_ok=True)
+            with open(os.path.join(cfg.out_dir, "snap", f"u{u:05d}.pkl"), "wb") as f:
+                pickle.dump({"cfg": cfg, "update": u, "params": jax.device_get(params)}, f)
         if u % cfg.ckpt_every == 0 or u == cfg.updates:
             with open(os.path.join(cfg.out_dir, "params.pkl"), "wb") as f:
                 pickle.dump({"cfg": cfg, "params": jax.device_get(params)}, f)
