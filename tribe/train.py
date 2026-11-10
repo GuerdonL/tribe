@@ -64,8 +64,9 @@ PRESETS = {
     "colab": TrainConfig(model=ModelConfig(d=192, n_layers=4, n_heads=6, K=16), n_envs=512, T=64,
                          epochs=2, minibatches=16, updates=2000, lr=3e-4, ckpt_every=20,
                          out_dir="runs/m1_colab"),
+    # memory scales with (n_envs * T / minibatches) * K: 128 minibatches -> 1024 windows of 32 frames
     "gpu": TrainConfig(model=ModelConfig(d=256, n_layers=6, n_heads=8, K=32), n_envs=2048, T=64,
-                       epochs=3, minibatches=32, updates=3000, lr=2e-4, out_dir="runs/m1_gpu"),
+                       epochs=3, minibatches=128, updates=3000, lr=2e-4, out_dir="runs/m1_gpu"),
 }
 
 # reward shaping
@@ -315,13 +316,21 @@ def main():
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", action="store_true", help="continue from <out>/ckpt.pkl if present")
+    ap.add_argument("--minibatches", type=int, default=None, help="more = smaller minibatches = less GPU memory")
+    ap.add_argument("--envs", type=int, default=None)
     args = ap.parse_args()
     cfg = PRESETS[args.preset]
     if args.updates:
         cfg = dataclasses.replace(cfg, updates=args.updates)
     if args.out:
         cfg = dataclasses.replace(cfg, out_dir=args.out)
+    if args.minibatches:
+        cfg = dataclasses.replace(cfg, minibatches=args.minibatches)
+    if args.envs:
+        cfg = dataclasses.replace(cfg, n_envs=args.envs)
     cfg = dataclasses.replace(cfg, seed=args.seed)
+    mb = cfg.n_envs * cfg.T // cfg.minibatches
+    print(f"minibatch = {mb} windows x {cfg.model.K} frames (memory scales with this product)", flush=True)
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     init_params, tx, reset_runner, update = make_train(cfg)

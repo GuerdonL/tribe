@@ -31,6 +31,7 @@ class ModelConfig:
     row_layers: int = 1          # set-attention layers over rows within a frame
     mlp_mult: int = 4
     dropout: float = 0.0
+    remat: bool = True           # gradient checkpointing: ~3x less activation memory, ~30% slower
 
 
 SELF_CARD = tuple(S.SELF_CARD)
@@ -82,8 +83,9 @@ class FrameEncoder(nn.Module):
         pos = self.param("row_pos", nn.initializers.normal(0.02), (N_ROWS, d))
         rows = jnp.concatenate([me_e, sl_e], axis=-2) + pos
         valid = jnp.concatenate([jnp.ones(frames.shape[:-1] + (1,), bool), slots[..., 0] > 0], axis=-1)
+        Row = nn.remat(RowAttention) if self.cfg.remat else RowAttention
         for l in range(self.cfg.row_layers):
-            rows = RowAttention(d, self.cfg.n_heads, self.cfg.mlp_mult, name=f"row{l}")(rows, valid)
+            rows = Row(d, self.cfg.n_heads, self.cfg.mlp_mult, name=f"row{l}")(rows, valid)
         # masked mean pool
         w = valid.astype(rows.dtype)[..., None]
         pooled = (rows * w).sum(-2) / jnp.maximum(w.sum(-2), 1.0)
@@ -146,8 +148,9 @@ class Learner(nn.Module):
         x = x + po + tpos[-K:]
         causal = jnp.tril(jnp.ones((K, K), bool))
         mask = causal[None, None] & valid[:, None, None, :]                              # (B, 1, K, K)
+        Blk = nn.remat(GTrXLBlock) if cfg.remat else GTrXLBlock
         for l in range(cfg.n_layers):
-            x = GTrXLBlock(d, cfg.n_heads, cfg.mlp_mult, name=f"blk{l}")(x, mask)
+            x = Blk(d, cfg.n_heads, cfg.mlp_mult, name=f"blk{l}")(x, mask)
         h = nn.LayerNorm()(x)                                                           # (B, K, d)
         hl = h[:, -1]
         pi_action = nn.Dense(S.N_ACTIONS, name="pi_action")(hl)
