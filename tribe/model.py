@@ -273,13 +273,15 @@ class Predictor(nn.Module):
         return self_logits, slot_logits
 
 
-def prediction_losses(self_logits, slot_logits, next_frame):
-    """Per-example cross-entropies: (world, heard, heard_spoken, spoken_mask).
-    next_frame: (..., FRAME_LEN) ints.
+def prediction_losses(self_logits, slot_logits, next_frame, cur_frame=None):
+    """Per-example cross-entropies: (world, heard, heard_onset, onset_mask).
+    next_frame, cur_frame: (..., FRAME_LEN) ints.
 
-    `heard` is the loss term (heard_word + heard_dir on every step). `heard_spoken` is the
-    heard_word CE only where the target is a real word, with `spoken_mask` marking those
-    steps; most steps are silence, so `heard` alone mostly measures predicting <none>."""
+    `heard` is the loss term (heard_word + heard_dir on every step). `heard_onset` is the
+    heard_word CE only at word onsets: the next frame's word is a real word and differs from
+    the current frame's word. Most heard words are repeats of the previous step's word, so CE
+    over all spoken steps is near zero and says little; onsets are where the prediction is
+    earned. With cur_frame=None the mask is "any real word" (spoken steps)."""
     me = next_frame[..., : S.SELF_LEN]
     slots = next_frame[..., S.SELF_LEN:].reshape(next_frame.shape[:-1] + (S.N_SLOTS, S.SLOT_LEN))
 
@@ -291,7 +293,10 @@ def prediction_losses(self_logits, slot_logits, next_frame):
     world = 0.0
     heard = 0.0
     heard_spoken = 0.0
-    spoken_mask = (me[..., word_k] != S.NO_WORD).astype(jnp.float32)
+    spoken = me[..., word_k] != S.NO_WORD
+    if cur_frame is not None:
+        spoken = spoken & (me[..., word_k] != cur_frame[..., word_k])
+    spoken_mask = spoken.astype(jnp.float32)
     for k in range(S.SELF_LEN):
         l = ce(self_logits[k], me[..., k])
         if k in heard_idx:

@@ -124,7 +124,7 @@ def sample_out(key, logits):
     return out, logp_of(logits, out)
 
 
-def ppo_loss(cfg, logits, predict_fn, out, old_logp, adv, ret, next_frame, has_next):
+def ppo_loss(cfg, logits, predict_fn, out, old_logp, adv, ret, next_frame, has_next, cur_frame=None):
     """Shared PPO + prediction loss over flat (M, ...) samples. Prediction losses reach the
     trunk only through backprop; they never enter the advantage."""
     logp = logp_of(logits, out)
@@ -135,17 +135,17 @@ def ppo_loss(cfg, logits, predict_fn, out, old_logp, adv, ret, next_frame, has_n
     Ha, Hp, Hs = entropy_of(logits)
     ent = cfg.ent_action * Ha.mean() + cfg.ent_point * Hp.mean() + cfg.ent_say * Hs.mean()
     sl, ll = predict_fn(logits["h"], out)
-    world, heard, heard_spoken, spoken = prediction_losses(sl, ll, next_frame)
+    world, heard, heard_onset, onset = prediction_losses(sl, ll, next_frame, cur_frame)
     m = has_next.astype(jnp.float32)
     world = (world * m).sum() / jnp.maximum(m.sum(), 1.0)
     heard = (heard * m).sum() / jnp.maximum(m.sum(), 1.0)
-    # metric only (not in the loss): word CE on steps where a word was actually heard
-    sm = spoken * m
-    heard_spoken = (heard_spoken * m).sum() / jnp.maximum(sm.sum(), 1.0)
+    # metric only (not in the loss): word CE at word onsets (a new word, not a repeat)
+    om = onset * m
+    heard_onset = (heard_onset * m).sum() / jnp.maximum(om.sum(), 1.0)
     total = cfg.w_pi * (pg + cfg.vf_coef * vf - ent) + cfg.w_world * world + cfg.w_heard * heard
     approx_kl = ((ratio - 1) - jnp.log(ratio)).mean()
     return total, {"pg": pg, "vf": vf, "ent_action": Ha.mean(), "world": world, "heard": heard,
-                   "heard_spoken": heard_spoken, "spoken_frac": sm.sum() / jnp.maximum(m.sum(), 1.0),
+                   "heard_onset": heard_onset, "onset_frac": om.sum() / jnp.maximum(m.sum(), 1.0),
                    "approx_kl": approx_kl, "clipfrac": (jnp.abs(ratio - 1) > cfg.clip).mean()}
 
 
@@ -268,7 +268,7 @@ def make_train(cfg: TrainConfig):
         frames, prev_out, valid, out, old_logp, adv, ret, next_frame, has_next = batch
         logits = forward(params, frames, prev_out, valid)
         return ppo_loss(cfg, logits, lambda h, o: predict(params, h, o), out, old_logp, adv, ret,
-                        next_frame, has_next)
+                        next_frame, has_next, cur_frame=frames[:, -1])
 
     @jax.jit
     def update(params, opt_state, rs):
@@ -396,7 +396,8 @@ def make_train_xl(cfg: TrainConfig):
         flat = lambda x: x.reshape((-1,) + x.shape[2:])
         logits = jax.tree.map(flat, logits)
         return ppo_loss(cfg, logits, lambda h, o: predictor.apply(params["predictor"], h, o),
-                        flat(out), flat(old_logp), flat(adv), flat(ret), flat(next_frame), flat(has_next))
+                        flat(out), flat(old_logp), flat(adv), flat(ret), flat(next_frame), flat(has_next),
+                        cur_frame=flat(frames))
 
     @jax.jit
     def update(params, opt_state, rs):
@@ -530,7 +531,7 @@ def main():
         writer.writerow(m); fh.flush()
         if u % cfg.log_every == 0:
             print(f"u{u:5d} steps {m['steps']:>9,} | R/step {m['reward_per_step']:+.4f} deaths {int(m['deaths']):4d} "
-                  f"| world {m['world']:.3f} heard {m['heard']:.3f} (spoken {m['heard_spoken']:.2f}, {m['spoken_frac']*100:.0f}%) pg {m['pg']:+.3f} vf {m['vf']:.3f} H {m['ent_action']:.2f} "
+                  f"| world {m['world']:.3f} heard {m['heard']:.3f} (onset {m['heard_onset']:.2f}, {m['onset_frac']*100:.0f}%) pg {m['pg']:+.3f} vf {m['vf']:.3f} H {m['ent_action']:.2f} "
                   f"| gaze {m['gaze_follow_rate']:.2f} vs chance {m['gaze_chance']:.2f} (n={m['gaze_cues']}) "
                   f"| {m['elapsed_s']:.0f}s", flush=True)
         if u % cfg.ckpt_every == 0 or u == cfg.updates:
