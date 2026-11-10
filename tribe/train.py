@@ -60,8 +60,12 @@ class TrainConfig:
 PRESETS = {
     "cpu": TrainConfig(model=ModelConfig(d=64, n_layers=2, n_heads=4, K=8), n_envs=32, T=32,
                        epochs=2, minibatches=4, updates=60, out_dir="runs/m1_cpu"),
+    # fits a 16 GB T4 (Colab free): ~1.6M params, 2k-sample minibatches of 16-frame windows
+    "colab": TrainConfig(model=ModelConfig(d=192, n_layers=4, n_heads=6, K=16), n_envs=512, T=64,
+                         epochs=2, minibatches=16, updates=2000, lr=3e-4, ckpt_every=20,
+                         out_dir="runs/m1_colab"),
     "gpu": TrainConfig(model=ModelConfig(d=256, n_layers=6, n_heads=8, K=32), n_envs=2048, T=64,
-                       epochs=3, minibatches=16, updates=3000, lr=2e-4, out_dir="runs/m1_gpu"),
+                       epochs=3, minibatches=32, updates=3000, lr=2e-4, out_dir="runs/m1_gpu"),
 }
 
 # reward shaping
@@ -310,6 +314,7 @@ def main():
     ap.add_argument("--updates", type=int, default=None)
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--resume", action="store_true", help="continue from <out>/ckpt.pkl if present")
     args = ap.parse_args()
     cfg = PRESETS[args.preset]
     if args.updates:
@@ -326,13 +331,21 @@ def main():
     n_params = sum(int(np.prod(p.shape)) for p in jax.tree.leaves(params))
     opt_state = tx.init(params)
     rs = reset_runner(k_r)
+    start = 1
+    ckpt_path = os.path.join(cfg.out_dir, "ckpt.pkl")
+    if args.resume and os.path.exists(ckpt_path):
+        with open(ckpt_path, "rb") as f:
+            ck = pickle.load(f)
+        params, opt_state, start = ck["params"], ck["opt_state"], ck["update"] + 1
+        rs = reset_runner(jax.random.fold_in(k_r, start))
+        print(f"resumed from update {ck['update']}", flush=True)
     print(f"preset={args.preset} params={n_params:,} envs={cfg.n_envs} T={cfg.T} K={cfg.model.K} "
           f"device={jax.devices()[0].platform} out={cfg.out_dir}", flush=True)
 
     log_path = os.path.join(cfg.out_dir, "log.csv")
     writer = None
     t0 = time.time()
-    for u in range(1, cfg.updates + 1):
+    for u in range(start, cfg.updates + 1):
         params, opt_state, rs, trs, metrics = update(params, opt_state, rs)
         m = {k: float(v) for k, v in metrics.items()}
         fr = np.asarray(trs.frame).reshape(-1, S.FRAME_LEN)
@@ -342,9 +355,11 @@ def main():
         m["steps"] = u * cfg.n_envs * cfg.T
         m["elapsed_s"] = time.time() - t0
         if writer is None:
-            fh = open(log_path, "w", newline="")
+            append = start > 1 and os.path.exists(log_path)
+            fh = open(log_path, "a" if append else "w", newline="")
             writer = csv.DictWriter(fh, fieldnames=list(m.keys()))
-            writer.writeheader()
+            if not append:
+                writer.writeheader()
         writer.writerow(m); fh.flush()
         if u % cfg.log_every == 0:
             print(f"u{u:5d} steps {m['steps']:>9,} | R/step {m['reward_per_step']:+.4f} deaths {int(m['deaths']):4d} "
@@ -354,6 +369,11 @@ def main():
         if u % cfg.ckpt_every == 0 or u == cfg.updates:
             with open(os.path.join(cfg.out_dir, "params.pkl"), "wb") as f:
                 pickle.dump({"cfg": cfg, "params": jax.device_get(params)}, f)
+            tmp = ckpt_path + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump({"cfg": cfg, "update": u, "params": jax.device_get(params),
+                             "opt_state": jax.device_get(opt_state)}, f)
+            os.replace(tmp, ckpt_path)
 
 
 if __name__ == "__main__":
