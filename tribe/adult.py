@@ -17,6 +17,11 @@ import numpy as np
 from . import schema as S
 from .world import State, to_egocentric, from_egocentric, line_of_sight
 
+import os as _os
+NAME_IDLE = _os.environ.get("TRIBE_NAME_IDLE", "0") == "1"   # see jax_world.NAME_IDLE
+NAME_RADIUS = 6
+NAME_OF = {S.FOOD: S.WORD_ID["food"], S.WATER: S.WORD_ID["water"], S.TREE: S.WORD_ID["tree"],
+           S.ROCK: S.WORD_ID["rock"], S.SHELTER: S.WORD_ID["shelter"], S.HAZARD: S.WORD_ID["danger"]}
 FOLLOW_DIST = 3
 PREDATOR_WARN_DIST = 10
 NIGHT_WARN_LEAD = 12
@@ -115,7 +120,21 @@ def adult_act(state: State, i: int) -> tuple[int, int, int]:
         pointing = 1 if a == S.NOOP else 0
         return a, pointing, word          # name it while turning too, so the learner keeps watching
 
-    # --- idle: face the learner, say "look" every few steps
+    # --- idle: name the nearest landmark (if NAME_IDLE), else face the learner and say "look"
+    if NAME_IDLE and (state.t // 10) % 2 == 0:
+        ys, xs = np.where(state.terrain != S.EMPTY)
+        d = np.abs(xs - ax) + np.abs(ys - ay)
+        keep = (d <= NAME_RADIUS) & (d > 0)
+        if keep.any():
+            k = int(np.argmin(np.where(keep, d, 10 ** 9)))
+            nx_, ny_ = int(xs[k]), int(ys[k])
+            want = _facing_toward(nx_ - ax, ny_ - ay)
+            a = _turn_toward(int(state.facing[i]), want)
+            if a != S.NOOP:
+                return a, 0, S.NO_WORD
+            name = NAME_OF.get(int(state.terrain[ny_, nx_]), S.NO_WORD)
+            return S.NOOP, 1, name
+
     want = _facing_toward(lx - ax, ly - ay) if (lx, ly) != (ax, ay) else int(state.facing[i])
     a = _turn_toward(int(state.facing[i]), want)
     say = S.WORD_ID["look"] if (a == S.NOOP and state.t % 10 == 0) else S.NO_WORD

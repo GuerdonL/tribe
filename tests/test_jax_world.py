@@ -76,3 +76,33 @@ def test_adult_points_and_speaks_sometimes():
         says = jnp.stack([jnp.zeros(8, jnp.int32), asay], axis=1)
         st = J.step_batch(st, acts, pts, says)
     assert pointed > 0 and spoke > 0
+
+
+def test_name_idle_names_landmarks(monkeypatch):
+    """With NAME_IDLE on, an idle adult points at and names nearby terrain in both worlds."""
+    monkeypatch.setattr(J, "NAME_IDLE", True)
+    from tribe import adult as A
+    monkeypatch.setattr(A, "NAME_IDLE", True)
+    keys = jax.random.split(jax.random.PRNGKey(5), 8)
+    st = J.reset_batch(keys, 1, 1)
+    words = set()
+    for t in range(60):
+        aa, ap, asay = jax.vmap(J.adult_act, in_axes=(0, None))(st, 1)
+        words |= {int(w) for w, p in zip(np.asarray(asay), np.asarray(ap)) if p}
+        acts = jnp.stack([jnp.zeros(8, jnp.int32) + S.NOOP, aa], axis=1)
+        pts = jnp.stack([jnp.zeros(8, jnp.int32), ap.astype(jnp.int32)], axis=1)
+        says = jnp.stack([jnp.zeros(8, jnp.int32), asay], axis=1)
+        st = J.step_batch(st, acts, pts, says)
+    landmark_words = {S.WORD_ID[w] for w in ("tree", "rock", "food", "water", "shelter", "danger")}
+    assert words & landmark_words, words
+    # NumPy world agrees in kind
+    from tribe import world as W
+    from tribe.adult import adult_act
+    stn = W.reset(seed=5)
+    nwords = set()
+    for t in range(60):
+        a, p, w = adult_act(stn, 1)
+        if p:
+            nwords.add(w)
+        W.step(stn, np.array([S.NOOP, a]), np.array([0, p]), np.array([0, w]))
+    assert nwords & landmark_words, nwords

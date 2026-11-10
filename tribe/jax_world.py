@@ -43,6 +43,14 @@ ROCK_DENSITY = 0.03
 RELAX_ITERS = 28           # distance-field relaxation steps for adult pathing
 
 # adult
+# NAME_IDLE: when the adult has nothing the learner needs, it points at the nearest landmark
+# within NAME_RADIUS and names it (tree, rock, food, water, shelter, hazard -> danger). This
+# decouples word identity from the learner's meters: in M1 the adult only ever said "water"
+# when the learner was thirsty, so a word was predictable from self-state alone. Off by
+# default so M1 stays reproducible; set TRIBE_NAME_IDLE=1 to turn it on.
+import os as _os
+NAME_IDLE = _os.environ.get("TRIBE_NAME_IDLE", "0") == "1"
+NAME_RADIUS = 6
 FOLLOW_DIST = 3
 PREDATOR_WARN_DIST = 10
 HUNGRY = 0.5
@@ -556,9 +564,26 @@ def adult_act(st: EnvState, i):
     idle_face = _facing_toward(lx - ax, ly - ay)
     idle_turn = _turn_toward(st.facing[i], idle_face)
     idle_say = jnp.where((idle_turn == S.NOOP) & (st.t % 10 == 0), S.WORD_ID["look"], S.NO_WORD)
+    idle_point = jnp.bool_(False)
+    if NAME_IDLE:
+        # point at the nearest landmark to the adult and name it, whatever the learner needs
+        land = (st.terrain != S.EMPTY) & ((jnp.abs(XX - ax) + jnp.abs(YY - ay)) <= NAME_RADIUS) \
+            & ~((XX == ax) & (YY == ay))
+        nx_, ny_, nfound = _nearest_cell(land, ax, ay)
+        ntype = st.terrain[ny_, nx_]
+        name_of = jnp.array([S.NO_WORD, S.WORD_ID["food"], S.WORD_ID["water"], S.WORD_ID["tree"],
+                             S.WORD_ID["rock"], S.WORD_ID["shelter"], S.NO_WORD, S.WORD_ID["danger"],
+                             S.NO_WORD, S.NO_WORD], dtype=jnp.int32)
+        name_face = _facing_toward(nx_ - ax, ny_ - ay)
+        name_turn = _turn_toward(st.facing[i], name_face)
+        # alternate: name the landmark for 10 steps, then look at the learner for 10
+        naming = nfound & ((st.t // 10) % 2 == 0)
+        idle_turn = jnp.where(naming, name_turn, idle_turn)
+        idle_point = naming & (name_turn == S.NOOP)
+        idle_say = jnp.where(naming, jnp.where(idle_point, name_of[ntype], S.NO_WORD), idle_say)
 
     action = jnp.where(need_move, move_a, jnp.where(has, turn, idle_turn))
-    point_out = jnp.where(need_move, False, pointing)
+    point_out = jnp.where(need_move, False, jnp.where(has, pointing, idle_point))
     say_out = jnp.where(need_move, jnp.where(has, word, S.NO_WORD),
                         jnp.where(has, say_target, idle_say))
     action = jnp.where(any_learner, action, S.NOOP)
