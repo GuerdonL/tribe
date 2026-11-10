@@ -11,14 +11,15 @@ Owner: Guerdon (GuerdonL on GitHub). He wants to move fast and prefers decisions
 ## Where things stand
 
 - **M0 passed** (hand-written policies, no model): gaze-following learner outlives gaze-ignoring one, +37.5 steps over 300 paired episodes, 95% CI [+27.7, +47.3]. Reproduced in the JAX world (+33.6, CI [+20.6, +46.3]).
-- **M1 is built, not yet run.** `python -m tribe.train --preset gpu --resume` on this box is the job. First attempt OOMed at 42 GB on a 48 GB card; fixed by gradient checkpointing (`ModelConfig.remat`) and 128 minibatches. Not yet confirmed to fit. If it still OOMs: `--minibatches 256`, then `--envs 1024`.
+- **M1 is running with the XL learner** (2026-11-10, branch `xl-memory`): `python -m tribe.train --preset gpu_xl --resume`, log in `runs/m1_gpu_xl/log.csv`, stdout in `runs/m1_xl.log`. About 3.5 s/update on a 4090, so 3000 updates take about 3 h.
+- **Why not `--preset gpu`:** the windowed learner fits (37 GB with remat) but re-encodes a K=32 window for every rollout step and every training sample, about 120 s/update (about 100 h for 3000). It was stopped at update 11; its partial log is in `runs/m1_gpu/`. `arch="xl"` (`XLLearner`, `make_train_xl`) caches per-layer memory in the rollout and runs each env's segment once in training; `tests/test_train_xl.py` checks the training pass reproduces rollout log-probs exactly. Position is a relative bias, not absolute-in-window, so the two architectures are not checkpoint-compatible.
 - CPU smoke run (300k params, 150k steps) trained stably: world CE 52 -> 19, heard CE 4.7 -> 0.7, gaze metric at chance. That only proves the plumbing.
 
 ## M1 pass criterion
 
-In `runs/m1_gpu/log.csv`, `gaze_follow_rate` reliably above `gaze_chance`. The metric: among steps where a pointing adult is visible and faces the learner's left or right, the fraction of learner actions that are the matching turn; chance is the learner's base rate of that turn. Also watch `gaze_cues` (how often the cue even occurs per update; if it is tiny the metric is noise and the fix is on the adult side, in `jax_world.adult_act`, not the model) and `heard` (word-prediction CE; it should fall well below ln(23) = 3.1 as the model learns what adults say when).
+In `runs/m1_gpu_xl/log.csv`, `gaze_follow_rate` reliably above `gaze_chance`. The metric: among steps where a pointing adult is visible and faces the learner's left or right, the fraction of learner actions that are the matching turn; chance is the learner's base rate of that turn. Also watch `gaze_cues` (how often the cue even occurs per update; if it is tiny the metric is noise and the fix is on the adult side, in `jax_world.adult_act`, not the model) and `heard` (word-prediction CE; it should fall well below ln(23) = 3.1 as the model learns what adults say when).
 
-Expected timeline on a 4090-class card: a minute or two of compile, then well under a second per update; 3000 updates is on the order of an hour. Checkpoints every 50 updates to `ckpt.pkl`; `--resume` continues.
+Measured on a 4090: about 1 min compile, then about 3.5 s/update for `gpu_xl` (3000 updates is about 3 h). Checkpoints every 50 updates to `ckpt.pkl`; `--resume` continues. XL minibatches are groups of envs (`n_envs` must divide by `minibatches`; 32 means 4096 samples per gradient step).
 
 ## If M1 fails (gaze stays at chance)
 
@@ -36,8 +37,8 @@ Do not change the frame schema (`tribe/schema.py`, SCHEMA_VERSION 1) without bum
 ```
 tribe/schema.py      frozen frame layout and constants. Read it first.
 tribe/jax_world.py   the environment (batched JAX). adult_act is the scripted caretaker.
-tribe/model.py       Learner (frame encoder + GTrXL decoder + heads) and Predictor (next-frame).
-tribe/train.py       PPO + prediction losses, one jitted update, presets, resume, gaze metric.
+tribe/model.py       Learner (windowed GTrXL), XLLearner (cached-memory GTrXL: step / sequence), Predictor.
+tribe/train.py       PPO + prediction losses, make_train (window) / make_train_xl, presets, resume, gaze metric.
 tribe/world.py, frame.py, adult.py, policies.py, episode.py   NumPy reference world and M0 (keep in sync with jax_world semantics; tests compare them)
 scripts/m0.py, m0_jax.py, replay.py, vast_setup.sh
 tests/               run `python -m pytest tests -q` (~1 min CPU) after any change
