@@ -187,7 +187,7 @@ class XLBlock(nn.Module):
         k = nn.DenseGeneral((H, dh), name="k")(hk)
         v = nn.DenseGeneral((H, dh), name="v")(hk)
         bias = self.param("rel_bias", nn.initializers.zeros, (H, self.K))
-        logits = jnp.einsum("bqhd,bshd->bhqs", q, k) / jnp.sqrt(dh).astype(q.dtype) + bias[:, dist][None]
+        logits = jnp.einsum("bqhd,bshd->bhqs", q, k) / jnp.sqrt(dh).astype(q.dtype) + jnp.asarray(bias)[:, dist][None]
         logits = jnp.where(mask[:, None], logits, jnp.finfo(logits.dtype).min)
         a = jnp.einsum("bhqs,bshd->bqhd", jax.nn.softmax(logits, -1), v)
         a = nn.DenseGeneral(self.d, axis=(-2, -1), name="o")(a)
