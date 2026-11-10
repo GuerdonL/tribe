@@ -3,7 +3,7 @@ name = "tribe"
 version = "0.1.0"
 description = "Pre-verbal social pretraining for grounded language acquisition — stage one"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24"]
+dependencies = ["numpy>=1.24", "jax>=0.4", "optax", "flax"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
