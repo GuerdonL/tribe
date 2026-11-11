@@ -10,6 +10,7 @@ Because all models play the same worlds, different models can be drawn on one ma
 ```
 viz/build.py     sync with GuerdonL/tribe-runs, record what is new, write viz/data/ (git-ignored)
 viz/serve.py     web server: viz/site + viz/data, HTTP Basic auth, standard library only
+viz/live.py      inside the server: reads each running instance's log.csv over SSH every few seconds (the Live panel)
 viz/site/        the page (plain HTML, CSS and JavaScript; no build step)
 viz/install.sh   systemd user services: the server, and a timer that runs build.py every 30 minutes
 ```
@@ -35,3 +36,12 @@ start. The connection is plain HTTP: the password keeps casual visitors out, it 
   beside them are means over the 10 updates before the snapshot.
 - Changing `N_WORLDS`, the seeds or the recorded fields in `build.py` needs `VERSION` bumped (re-records everything).
 - A run's latest weights (`params.pkl`) are re-recorded whenever the file changes, so a run in progress updates.
+
+## Live runs
+
+While box-boy instances are running, the page shows a Live panel: progress, time left, cost, and the training
+metrics as they are logged. `live.py` lists the project's Vast.ai instances once a minute and fetches the new bytes
+of each `runs/<job>/log.csv` over SSH every 8 seconds; the page asks `/live/state.json` for rows it does not have.
+It needs what `bb logs` needs (the `vastai` login and this machine's SSH key on the instances). If an instance
+refuses the key, it falls back to the copy uploaded to the results repo, up to 10 minutes behind, and says so.
+After changing `serve.py` or `live.py`: `systemctl --user restart tribe-viz`.

@@ -10,12 +10,13 @@ start. The connection is plain HTTP, so the password is not protected against so
 import argparse
 import base64
 import gzip
+import json
 import hmac
 import os
 import secrets
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOTS = {"data": os.path.join(HERE, "data"), "": os.path.join(HERE, "site")}
@@ -23,6 +24,7 @@ TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=u
          ".json": "application/json", ".svg": "image/svg+xml", ".ico": "image/x-icon"}
 AUTH_FILE = os.path.expanduser("~/.config/tribe-viz/auth")
 AUTH = None          # "user:password", or None for no auth
+LIVE = None          # live.Live poller, or None with --no-live
 
 
 def load_auth():
@@ -39,7 +41,8 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+        if "/live/state.json" not in (args[0] if args else ""):          # polled every few seconds
+            sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
 
     def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=()):
         self.send_response(code)
@@ -71,6 +74,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._send(401, b"password required\n", extra=[("WWW-Authenticate", 'Basic realm="tribe", charset="UTF-8"')])
         path = unquote(self.path.split("?", 1)[0].split("#", 1)[0])
+        if path == "/live/state.json":
+            return self._live()
         if path == "/":
             path = "/index.html"
         parts = [p for p in path.split("/") if p]
@@ -97,16 +102,39 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, TYPES[ext], cache)
 
 
+    def _live(self):
+        """Live training logs: only the rows the page does not have yet (?have=run:rows,run:rows)."""
+        if LIVE is None:
+            body = json.dumps(dict(runs=[], error="live data is switched off", disabled=True)).encode()
+        else:
+            have = {}
+            for part in parse_qs(urlsplit(self.path).query).get("have", [""])[0].split(","):
+                name, _, n = part.rpartition(":")
+                if name and n.isdigit():
+                    have[name] = int(n)
+            body = json.dumps(LIVE.state(have), separators=(",", ":")).encode()
+        extra = [("Cache-Control", "no-store")]
+        if "gzip" in self.headers.get("Accept-Encoding", "") and len(body) > 1024:
+            body = gzip.compress(body, 5)
+            extra.append(("Content-Encoding", "gzip"))
+        self._send(200, body, "application/json", extra)
+
+
 def main():
-    global AUTH
+    global AUTH, LIVE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--no-auth", action="store_true", help="no password (only sensible with --host 127.0.0.1)")
+    ap.add_argument("--no-live", action="store_true", help="do not read live logs from the running instances over SSH")
     a = ap.parse_args()
     if a.no_auth and a.host not in ("127.0.0.1", "localhost", "::1"):
         sys.exit("--no-auth is only allowed with --host 127.0.0.1")
     AUTH = None if a.no_auth else load_auth()
+    if not a.no_live:
+        sys.path.insert(0, HERE)
+        import live
+        LIVE = live.Live().start()
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     srv.daemon_threads = True
     print(f"serving on http://{a.host}:{a.port}" + ("" if a.no_auth else f" (login in {AUTH_FILE})"), flush=True)

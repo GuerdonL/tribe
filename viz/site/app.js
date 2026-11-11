@@ -670,6 +670,158 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
+// ------------------------------------------------------------------- live ---
+/* Rows arrive from /live/state.json, which the server fills by reading each running instance's log.csv. */
+const LIVE = { runs: new Map(), hover: false, dirty: false, sig: '' };
+const LIVE_METRICS = ['loss', 'world', 'heard', 'deaths', 'reward_per_step', 'gaze_gap', 'ent_action', 'clipfrac'];
+const STATE_LABEL = { starting: 'starting', loading: 'loading the image', setup: 'setting up', training: 'training', ended: 'ended' };
+
+function liveCol(r, k) {
+  if (k === 'gaze_gap') {
+    const a = r.cols.gaze_follow_rate, b = r.cols.gaze_chance;
+    return a && b ? a.map((v, i) => (v == null || b[i] == null ? null : v - b[i])) : null;
+  }
+  return r.cols[k] || null;
+}
+const tailMean = (ys, n) => { if (!ys) return null; const v = ys.slice(-n).filter((x) => x != null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; };
+function liveColor(name) {
+  const i = [...LIVE.runs.keys()].sort().indexOf(name);
+  return i >= 0 && i < 8 ? cssVar(`--series-${i + 1}`) : cssVar('--other');
+}
+function duration(sec) {
+  if (sec == null || !isFinite(sec)) return '–';
+  const m = Math.round(sec / 60);
+  return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : m >= 1 ? `${m} min` : `${Math.round(sec)} s`;
+}
+
+async function pollLive() {
+  let delay = document.hidden ? 20000 : 4000;
+  try {
+    const have = [...LIVE.runs.values()].map((r) => `${encodeURIComponent(r.name)}:${r.n}`).join(',');
+    const d = await getJSON('live/state.json?have=' + have);
+    if (d.disabled) return;
+    const seen = new Set();
+    let changed = false;
+    for (const r of d.runs) {
+      seen.add(r.name);
+      let loc = LIVE.runs.get(r.name);
+      if (!loc || r.start !== loc.n || r.instance !== loc.instance) {
+        if (r.start !== 0) { LIVE.runs.set(r.name, { name: r.name, n: 0, cols: {}, instance: r.instance }); changed = true; continue; }   // out of step: ask for everything
+        loc = { name: r.name, n: 0, cols: {} };
+        LIVE.runs.set(r.name, loc);
+      }
+      for (const [k, v] of Object.entries(r.cols)) loc.cols[k] = (loc.cols[k] || []).concat(v);
+      if (r.n !== loc.n || r.state !== loc.state || r.detail !== loc.detail) changed = true;
+      Object.assign(loc, { n: r.n, state: r.state, detail: r.detail, gpu: r.gpu, dph: r.dph, total: r.total, instance: r.instance, age: r.last_row_age_s });
+    }
+    for (const k of [...LIVE.runs.keys()]) if (!seen.has(k)) { LIVE.runs.delete(k); changed = true; }
+    LIVE.error = d.error;
+    if (changed) { if (LIVE.hover) LIVE.dirty = true; else renderLive(); }
+    if (![...LIVE.runs.values()].some((r) => r.state !== 'ended')) delay = 20000;
+  } catch (e) { delay = 15000; }
+  setTimeout(pollLive, delay);
+}
+
+function renderLive() {
+  LIVE.dirty = false;
+  const runs = [...LIVE.runs.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const box = $('#live');
+  box.hidden = !runs.length;
+  if (!runs.length) return;
+  const active = runs.filter((r) => r.state !== 'ended').length;
+  $('#liveTitle').replaceChildren(active ? h('span', { class: 'pulse', 'aria-hidden': 'true' }) : null,
+    active ? `Training now: ${active} run${active === 1 ? '' : 's'}` : 'Recently ended runs');
+  $('#liveLegend').replaceChildren(...runs.map((r) => h('span', { class: 'item' }, h('span', { class: 'key', style: `border-color:${liveColor(r.name)}` }), r.name)));
+
+  const tb = h('tbody');
+  let cost = 0;
+  for (const r of runs) {
+    const el = r.cols.elapsed_s, n = r.n;
+    const k = Math.min(20, n - 1);
+    const rate = el && k > 0 && el[n - 1] != null && el[n - 1 - k] != null ? (el[n - 1] - el[n - 1 - k]) / k : null;
+    const upd = r.cols.update && n ? r.cols.update[n - 1] : 0;
+    const frac = r.total ? Math.min(1, upd / r.total) : 0;
+    if (r.state !== 'ended' && r.dph) cost += r.dph;
+    const eta = r.state === 'training' && rate && r.total ? (r.total - upd) * rate : null;
+    tb.append(h('tr', { class: r.state === 'ended' ? 'ended' : '' },
+      h('td', {}, h('span', { class: 'key', style: `display:inline-block;vertical-align:middle;margin-right:6px;border-color:${liveColor(r.name)}` }), r.name),
+      h('td', {}, STATE_LABEL[r.state] || r.state, r.detail ? h('span', { class: 'sub' }, r.detail) : null),
+      h('td', { class: 'num' }, h('span', { class: 'meter', role: 'img', 'aria-label': `${Math.round(frac * 100)}% done` }, h('i', { style: `width:${(frac * 100).toFixed(1)}%` })), `${upd} / ${r.total || '?'}`),
+      h('td', { class: 'num' }, rate ? rate.toFixed(1) + ' s' : '–'),
+      h('td', { class: 'num' }, duration(eta)),
+      h('td', { class: 'num' }, fmt(tailMean(liveCol(r, 'loss'), 10))),
+      h('td', { class: 'num' }, fmt(tailMean(liveCol(r, 'deaths'), 10))),
+      h('td', { class: 'num' }, fmt(tailMean(liveCol(r, 'gaze_gap'), 10), 'train_gaze_gap')),
+      h('td', { class: 'num' }, r.dph ? '$' + r.dph.toFixed(2) : '–')));
+  }
+  $('#liveTable').replaceChildren(h('table', {}, h('thead', {}, h('tr', {}, ...[['Run'], ['State'], ['Update', 1], ['Per update', 1], ['Time left', 1], ['Loss', 1], ['Deaths per update', 1], ['Gaze above chance', 1], ['Per hour', 1]]
+    .map(([t, nm]) => h('th', { class: nm ? 'num' : '' }, t)))), tb),
+    LIVE.error ? h('p', { class: 'hint' }, `Live data problem: ${LIVE.error}.`) : cost ? h('p', { class: 'hint' }, `Running instances cost $${cost.toFixed(2)} per hour in total.`) : null);
+
+  const grid = $('#liveCharts');
+  grid.replaceChildren();
+  for (const k of LIVE_METRICS) {
+    const series = runs.map((r) => ({ r, ys: liveCol(r, k) })).filter((x) => x.ys && x.ys.length);
+    if (!series.length) continue;
+    const cell = h('div', {}, h('h3', {}, label('train_' + k)), h('div', { class: 'chart' }));
+    grid.append(cell);
+    liveChart(cell.lastChild, k, series);
+  }
+}
+
+function liveChart(box, metric, series) {
+  const W = box.clientWidth || 300, H = 150, L = 44, R = 8, T = 8, B = 20, win = 10;
+  let y0 = Infinity, y1 = -Infinity, x1 = 1;
+  const lines = series.map(({ r, ys }) => {
+    const pts = [];
+    let sum = 0, cnt = 0;
+    const q = [];
+    for (let i = 0; i < ys.length; i++) {
+      q.push(ys[i]); if (ys[i] != null) { sum += ys[i]; cnt++; }
+      if (q.length > win) { const d = q.shift(); if (d != null) { sum -= d; cnt--; } }
+      const u = r.cols.update && r.cols.update[i] != null ? r.cols.update[i] : i + 1;
+      if (cnt && i >= Math.min(win, 4) - 1) { const v = sum / cnt; pts.push([u, v]); y0 = Math.min(y0, v); y1 = Math.max(y1, v); }
+    }
+    x1 = Math.max(x1, r.total || 0, pts.length ? pts[pts.length - 1][0] : 0);
+    return { r, pts, color: liveColor(r.name) };
+  }).filter((l) => l.pts.length);
+  if (!lines.length) { box.append(h('div', { class: 'empty' }, 'Waiting for the first updates.')); return; }
+  const yt = niceTicks(y0, y1, 3);
+  y0 = Math.min(y0, yt[0]); y1 = Math.max(y1, yt[yt.length - 1]);
+  if (!(y1 > y0)) { y0 -= 1; y1 += 1; }
+  const X = (u) => L + u / x1 * (W - L - R), Y = (v) => T + (1 - (v - y0) / (y1 - y0)) * (H - T - B);
+  const svg = s('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': `${label('train_' + metric)} for the runs training now` });
+  for (const v of yt) {
+    svg.append(s('line', { x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: cssVar('--grid'), 'stroke-width': 1 }));
+    svg.append(s('text', { x: L - 5, y: Y(v) + 4, 'text-anchor': 'end' }, tickFmt(v, false)));
+  }
+  svg.append(s('line', { x1: L, x2: W - R, y1: H - B, y2: H - B, stroke: cssVar('--axis'), 'stroke-width': 1 }));
+  for (const v of niceTicks(0, x1, 3)) if (v <= x1) svg.append(s('text', { x: X(v), y: H - 5, 'text-anchor': v === 0 ? 'start' : X(v) > W - 24 ? 'end' : 'middle' }, tickFmt(v, false)));
+  for (const l of lines) {
+    svg.append(s('path', { d: l.pts.map(([u, v], i) => `${i ? 'L' : 'M'}${X(u).toFixed(1)},${Y(v).toFixed(1)}`).join(''), fill: 'none', stroke: l.color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+    const [u, v] = l.pts[l.pts.length - 1];
+    if (l.r.state !== 'ended') svg.append(s('circle', { cx: X(u), cy: Y(v), r: 4, fill: l.color, stroke: cssVar('--surface'), 'stroke-width': 2 }));
+  }
+  const cross = s('line', { y1: T, y2: H - B, stroke: cssVar('--axis'), 'stroke-width': 1, visibility: 'hidden' });
+  svg.append(cross);
+  svg.addEventListener('pointermove', (ev) => {
+    LIVE.hover = true;
+    const rc = svg.getBoundingClientRect(), x = ev.clientX - rc.left;
+    const u = Math.max(1, Math.round((x - L) / (W - L - R) * x1));
+    const rows = [];
+    for (const l of lines) {
+      let best = null;
+      for (const p of l.pts) if (!best || Math.abs(p[0] - u) < Math.abs(best[0] - u)) best = p;
+      if (best && Math.abs(best[0] - u) <= Math.max(3, x1 / 60)) rows.push({ color: l.color, value: fmt(best[1], metric === 'gaze_gap' ? 'train_gaze_gap' : null), name: l.r.name });
+    }
+    if (!rows.length) { hideTip(); cross.setAttribute('visibility', 'hidden'); return; }
+    cross.setAttribute('x1', X(u)); cross.setAttribute('x2', X(u)); cross.setAttribute('visibility', 'visible');
+    showTip(ev.clientX, ev.clientY, `update ${u}`, rows);
+  });
+  svg.addEventListener('pointerleave', () => { LIVE.hover = false; hideTip(); cross.setAttribute('visibility', 'hidden'); if (LIVE.dirty) renderLive(); });
+  box.append(svg);
+}
+
 // ------------------------------------------------------------------- wire ---
 function renderAll() { renderLegend(); renderA(); renderB(); renderTable(); renderModel(); }
 function sizeCanvas() {
@@ -733,7 +885,8 @@ async function init() {
     else if (e.key === 'ArrowRight' && e.target.type !== 'range') stepBy(1);
   });
   let rt = 0;
-  addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { sizeCanvas(); renderA(); renderB(); renderModel(); }, 120); });
+  addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { sizeCanvas(); renderA(); renderB(); renderModel(); renderLive(); }, 120); });
+  pollLive();
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => location.reload());
 
   sizeCanvas(); renderMapKey();
