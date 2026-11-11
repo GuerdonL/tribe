@@ -246,10 +246,12 @@ def heard(state: State, i: int) -> tuple[int, int]:
 
 
 # ------------------------------------------------------------------ step ---
-def step(state: State, actions: np.ndarray, pointing: np.ndarray, saying: np.ndarray) -> State:
+def step(state: State, actions: np.ndarray, pointing: np.ndarray, saying: np.ndarray,
+         night_drain: float = WARMTH_DRAIN_NIGHT, predator_move_every: int = PREDATOR_MOVE_EVERY) -> State:
     """Advance one tick. Mutates and returns `state`.
 
     actions, pointing, saying: (A,) arrays for every agent, adults included.
+    night_drain, predator_move_every: same meaning as jax_world.WorldParams; the defaults are the M1 world.
     """
     st = state
     st.events = []
@@ -297,7 +299,7 @@ def step(state: State, actions: np.ndarray, pointing: np.ndarray, saying: np.nda
         if st.sheltered[i] or not night:
             st.warmth[i] = min(1.0, st.warmth[i] + WARMTH_RECOVER)
         else:
-            st.warmth[i] -= WARMTH_DRAIN_NIGHT
+            st.warmth[i] -= night_drain
         for name, arr in (("hunger", st.hunger), ("thirst", st.thirst), ("warmth", st.warmth)):
             if arr[i] <= 0.0:
                 arr[i] = 0.0
@@ -314,7 +316,7 @@ def step(state: State, actions: np.ndarray, pointing: np.ndarray, saying: np.nda
             st.predator_active = True
             st.predator_pos = st.predator_lair.copy()
             st.events.append("predator wakes")
-        if st.t % PREDATOR_MOVE_EVERY == 0:
+        if st.t % predator_move_every == 0:
             targets = [i for i in st.learners() if st.alive[i] and not st.sheltered[i]]
             if targets:
                 d = [abs(st.pos[i, 0] - st.predator_pos[0]) + abs(st.pos[i, 1] - st.predator_pos[1])

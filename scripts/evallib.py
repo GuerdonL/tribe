@@ -161,7 +161,7 @@ def make_rollout(cfg, transform=t_identity, extra=None, reset=True):
 
         logits, new_mem = apply(obs)
         out, _ = sample_out(k_s, logits)
-        env2, reward, done = world_step_raw(env, out)
+        env2, reward, done = world_step_raw(env, out, cfg)
         rec = dict(ep=ep, act=out[:, 0], reward=reward, done=done, cause=death_cause(env2), value=logits["value"],
                    hunger=env.hunger[:, 0], thirst=env.thirst[:, 0], warmth=env.warmth[:, 0],
                    sheltered=env.sheltered[:, 0], phase=J.phase(env.t), t=env.t)

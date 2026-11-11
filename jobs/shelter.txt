@@ -1,0 +1,8 @@
+# Which of the two stops sheltering: the warmth reward, or nights that cost nothing?
+# reward (recover = M1, deficit) x night drain (1/35 = M1, 1/22 harsh but survivable, 1/15 lethal), seed 0, 600 updates.
+# The recover x 1/35 cell is M1 itself (seeds 1 and 2 have snapshots at the same updates).
+sh_def_d35: python -m tribe.train --preset gpu_xl --seed 0 --updates 600 --out runs/sh_def_d35 --warmth-reward deficit --snapshots 100,200,300,400,600 --resume
+sh_def_d22: python -m tribe.train --preset gpu_xl --seed 0 --updates 600 --out runs/sh_def_d22 --warmth-reward deficit --night-drain 1/22 --snapshots 100,200,300,400,600 --resume
+sh_def_d15: python -m tribe.train --preset gpu_xl --seed 0 --updates 600 --out runs/sh_def_d15 --warmth-reward deficit --night-drain 1/15 --snapshots 100,200,300,400,600 --resume
+sh_rec_d22: python -m tribe.train --preset gpu_xl --seed 0 --updates 600 --out runs/sh_rec_d22 --night-drain 1/22 --snapshots 100,200,300,400,600 --resume
+sh_rec_d15: python -m tribe.train --preset gpu_xl --seed 0 --updates 600 --out runs/sh_rec_d15 --night-drain 1/15 --snapshots 100,200,300,400,600 --resume

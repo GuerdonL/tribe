@@ -56,6 +56,12 @@ class TrainConfig:
     ckpt_every: int = 50
     out_dir: str = "runs/m1"
     snapshots: tuple = ()          # updates at which to keep a copy of the params (snap/u<update>.pkl)
+    # world and reward variants; the defaults are the M1 setup (checkpoints from before these fields read as defaults)
+    warmth_reward: str = "recover"  # "recover": pay R_NEED per unit of warmth regained (M1; rewards getting cold first)
+                                    # "deficit": no pay for regained warmth; charge r_cold * (1 - warmth) per step
+    r_cold: float = 0.1
+    night_drain: float = J.WARMTH_DRAIN_NIGHT
+    predator_move_every: int = J.PREDATOR_MOVE_EVERY
 
 
 PRESETS = {
@@ -83,25 +89,39 @@ R_NEED = 2.0
 R_DEATH = -1.0
 
 
-def world_step_raw(env, out):
-    """Learner output (N, 3) + scripted adult -> (next env before any reset, reward, done)."""
+M1_CFG = TrainConfig()
+
+
+def world_step_raw(env, out, cfg=None):
+    """Learner output (N, 3) + scripted adult -> (next env before any reset, reward, done).
+    cfg picks the world and reward variant; None is the M1 setup."""
+    cfg = cfg or M1_CFG
+    wp = J.WorldParams(night_drain=cfg.night_drain, predator_move_every=cfg.predator_move_every)
     aa, ap, asay = jax.vmap(J.adult_act, in_axes=(0, None))(env, 1)
     acts = jnp.stack([out[:, 0], aa], axis=1)
     pts = jnp.stack([out[:, 1], ap.astype(jnp.int32)], axis=1)
     says = jnp.stack([out[:, 2], asay], axis=1)
-    before = (env.hunger[:, 0], env.thirst[:, 0], env.warmth[:, 0])
-    env2 = jax.vmap(J.step)(env, acts, pts, says)
-    gains = sum(jnp.maximum(a2 - a1, 0.0) for a1, a2 in zip(before, (env2.hunger[:, 0], env2.thirst[:, 0], env2.warmth[:, 0])))
+    env2 = jax.vmap(partial(J.step, wp=wp))(env, acts, pts, says)
+    gain = lambda m: jnp.maximum(m(env2)[:, 0] - m(env)[:, 0], 0.0)
+    gains = gain(lambda e: e.hunger) + gain(lambda e: e.thirst)
     died = env2.died_this_step[:, 0]
-    reward = R_ALIVE * env2.alive[:, 0] + R_NEED * gains + R_DEATH * died
+    alive = env2.alive[:, 0]
+    if cfg.warmth_reward == "recover":
+        gains = gains + gain(lambda e: e.warmth)
+        cold = 0.0
+    elif cfg.warmth_reward == "deficit":
+        cold = cfg.r_cold * (1.0 - env2.warmth[:, 0]) * alive
+    else:
+        raise ValueError(f"warmth_reward={cfg.warmth_reward!r}")
+    reward = R_ALIVE * alive + R_NEED * gains - cold + R_DEATH * died
     done = died | (env2.t >= S.EPISODE_STEPS)
     return env2, reward, done
 
 
-def world_step(env, out, key):
+def world_step(env, out, key, cfg=None):
     """world_step_raw, then auto-reset the environments whose episode ended."""
     N = out.shape[0]
-    env2, reward, done = world_step_raw(env, out)
+    env2, reward, done = world_step_raw(env, out, cfg)
     fresh = J.reset_batch(jax.random.split(key, N), 1, 1)
     env3 = jax.tree.map(lambda a, b: jnp.where(done.reshape((-1,) + (1,) * (a.ndim - 1)), b, a), env2, fresh)
     return env3, reward, done
@@ -236,7 +256,7 @@ def make_train(cfg: TrainConfig):
         logits = forward(params, frames, prev_out, valid)
         key, k_s, k_r = jax.random.split(rs.key, 3)
         out, logp = sample_out(k_s, logits)
-        env3, reward, done = world_step(env, out, k_r)
+        env3, reward, done = world_step(env, out, k_r, cfg)
         # buffers: push this frame/out, then advance episode id where done
         buf_frames = jnp.concatenate([rs.buf_frames[:, 1:], frame[:, None]], axis=1)
         buf_out = jnp.concatenate([rs.buf_out[:, 1:], out[:, None]], axis=1)
@@ -386,7 +406,7 @@ def make_train_xl(cfg: TrainConfig):
         logits, new_mem, prev_same = policy_step(params, rs, frame)
         key, k_s, k_r = jax.random.split(rs.key, 3)
         out, logp = sample_out(k_s, logits)
-        env3, reward, done = world_step(rs.env, out, k_r)
+        env3, reward, done = world_step(rs.env, out, k_r, cfg)
         mem_ep = jnp.concatenate([rs.mem_ep[:, 1:], rs.ep_id[:, None]], axis=1)
         tr = XLTransition(frame=frame, out=out, prev_out=rs.last_out, prev_same=prev_same, ep=rs.ep_id,
                           logp=logp, value=logits["value"], reward=reward, done=done)
@@ -476,6 +496,11 @@ def main():
     ap.add_argument("--remat", action="store_true", help="gradient checkpointing (xl presets default off)")
     ap.add_argument("--lr", type=float, default=None)
     ap.add_argument("--K", type=int, default=None, help="frames of context")
+    ap.add_argument("--warmth-reward", choices=["recover", "deficit"], default=None,
+                    help="recover = M1 (pays for warmth regained); deficit = charge for being cold instead")
+    ap.add_argument("--night-drain", type=str, default=None,
+                    help="warmth lost per night step outside, e.g. 1/15 (M1: 1/35, which never kills)")
+    ap.add_argument("--predator-every", type=int, default=None, help="night steps per predator move (M1: 2)")
     ap.add_argument("--snapshots", type=str, default=None,
                     help="comma-separated updates at which to keep params in <out>/snap/")
     args = ap.parse_args()
@@ -496,6 +521,13 @@ def main():
         cfg = dataclasses.replace(cfg, lr=args.lr)
     if args.snapshots:
         cfg = dataclasses.replace(cfg, snapshots=tuple(int(x) for x in args.snapshots.split(",")))
+    if args.warmth_reward:
+        cfg = dataclasses.replace(cfg, warmth_reward=args.warmth_reward)
+    if args.night_drain:
+        num, _, den = args.night_drain.partition("/")
+        cfg = dataclasses.replace(cfg, night_drain=float(num) / float(den or 1))
+    if args.predator_every:
+        cfg = dataclasses.replace(cfg, predator_move_every=args.predator_every)
     cfg = dataclasses.replace(cfg, seed=args.seed)
     mb = cfg.n_envs * cfg.T // cfg.minibatches
     if cfg.model.arch == "xl":
@@ -522,6 +554,9 @@ def main():
     print(f"preset={args.preset} params={n_params:,} envs={cfg.n_envs} T={cfg.T} K={cfg.model.K} "
           f"device={jax.devices()[0].platform} out={cfg.out_dir}", flush=True)
 
+    if (cfg.warmth_reward, cfg.night_drain, cfg.predator_move_every) != (M1_CFG.warmth_reward, M1_CFG.night_drain, M1_CFG.predator_move_every):
+        print(f"world variant: warmth_reward={cfg.warmth_reward} r_cold={cfg.r_cold} night_drain=1/{1 / cfg.night_drain:.1f} "
+              f"predator_move_every={cfg.predator_move_every}", flush=True)
     log_path = os.path.join(cfg.out_dir, "log.csv")
     writer = None
     t0 = time.time()

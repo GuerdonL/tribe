@@ -72,6 +72,16 @@ Fix before any M2 training:
   needs nights that cost something. Whether the reward term or the harmless night is what stops sheltering is untested.
 - Consequence: "home" and "here" are ignored by the learner, and the adult says "home" about 40% of each day.
 
+Both are now switchable, defaults unchanged (M1): `--warmth-reward deficit` (no pay for regained warmth; charge
+`r_cold * (1 - warmth)` per step, 0.1 by default) and `--night-drain 1/15` (`J.WorldParams`, also `--predator-every`).
+`tests/test_world_variants.py` covers them. Things measured while adding them (2026-11-11):
+- A night is lethal exactly when 20 * drain >= 1: 1/20 or faster kills anyone who never shelters, 1/22 leaves 0.09.
+- Seed-0 final learner at dusk start: median 14 cells from the shelter (p90 21, 99% within 25), adult 2-3 cells away.
+  At 1/15 there are 12 dusk + 15 night steps to get there, so it is reachable for most, not all.
+- The hand-written follower does not manage it (96% cold deaths at 1/15, sheltered 24% of night steps), so M0-style
+  hand policies are not a baseline for lethal nights.
+- `jobs/shelter.txt`: reward x night-drain grid, 600 updates each, seed 0. The M1 cell is seeds 1 and 2 on this box.
+
 ## Running on several instances
 
 `python scripts/fleet.py launch jobs/<file>.txt --dry-run` shows the instances and hourly cost; without `--dry-run`

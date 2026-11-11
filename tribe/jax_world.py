@@ -261,7 +261,16 @@ def reset(key, n_learners: int = 1, n_adults: int = 1) -> EnvState:
 
 
 # -------------------------------------------------------------- step ---
-def step(st: EnvState, actions, pointing, saying) -> EnvState:
+class WorldParams(NamedTuple):
+    """World constants a run may change. The defaults are the M1 world. Python numbers, fixed at trace time."""
+    night_drain: float = WARMTH_DRAIN_NIGHT          # warmth lost per night step outside a shelter
+    predator_move_every: int = PREDATOR_MOVE_EVERY   # night steps per predator move
+
+
+M1_WORLD = WorldParams()
+
+
+def step(st: EnvState, actions, pointing, saying, wp: WorldParams = M1_WORLD) -> EnvState:
     A = st.pos.shape[0]
     actions = actions.astype(jnp.int32)
     alive_before = st.alive
@@ -310,7 +319,7 @@ def step(st: EnvState, actions, pointing, saying) -> EnvState:
     thirst = jnp.where(learner, thirst - THIRST_DRAIN, thirst)
     warm_ok = sheltered | ~night
     warmth = jnp.where(learner, jnp.where(warm_ok, jnp.minimum(1.0, st.warmth + WARMTH_RECOVER),
-                                          st.warmth - WARMTH_DRAIN_NIGHT), st.warmth)
+                                          st.warmth - wp.night_drain), st.warmth)
     starved = learner & ((hunger <= 0) | (thirst <= 0) | (warmth <= 0))
     hunger, thirst, warmth = jnp.maximum(hunger, 0.0), jnp.maximum(thirst, 0.0), jnp.maximum(warmth, 0.0)
 
@@ -331,7 +340,7 @@ def step(st: EnvState, actions, pointing, saying) -> EnvState:
     ddy = pos[tgt, 1] - ppos[1]
     step_x = jnp.where(jnp.abs(ddx) >= jnp.abs(ddy), jnp.sign(ddx), 0)
     step_y = jnp.where(jnp.abs(ddx) >= jnp.abs(ddy), 0, jnp.sign(ddy))
-    moves = night & has_t & ((st.t % PREDATOR_MOVE_EVERY) == 0)
+    moves = night & has_t & ((st.t % wp.predator_move_every) == 0)
     ppos = jnp.where(moves, ppos + jnp.stack([step_x, step_y]).astype(jnp.int32), ppos)
     ppos = jnp.where(night, ppos, st.predator_lair)
     pd = jnp.abs(pos[:, 0] - ppos[0]) + jnp.abs(pos[:, 1] - ppos[1])
