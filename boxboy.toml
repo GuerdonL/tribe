@@ -1,0 +1,22 @@
+# How box-boy (github.com/GuerdonL/box-boy) runs this project's jobs on rented Vast.ai instances.
+# Run `bb` from inside this checkout. Jobs files are in jobs/.
+name = "tribe"                                   # instance labels are tribe:<job>; results go to <hf user>/tribe-runs
+image = "vastai/pytorch:cuda-13.2.1-auto"
+setup = "uv pip install -q -r requirements-gpu.txt"
+check = "python -c \"import jax; d = jax.devices(); print('jax', jax.__version__, d); assert d[0].platform == 'gpu'\""
+runs_dir = "runs"
+
+[env]
+XLA_PYTHON_CLIENT_PREALLOCATE = "false"
+
+[offer]
+gpu = "RTX_4090"
+max_price = 0.60        # $/h per instance
+max_total = 5.0         # $/h for one launch; bb refuses above this without --over-budget
+disk = 30               # GB
+exclude_geo = "CN"      # Hugging Face is unreachable from there
+
+[run]
+sync_s = 600            # seconds between uploads
+on_done = "destroy"     # a successful job destroys its instance; a failed one stops it
+max_hours = 24          # a job running longer than this is stopped as failed

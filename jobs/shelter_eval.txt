@@ -1,0 +1,3 @@
+# Evaluate the shelter grid's snapshots (needs a GPU, so it is a job too). Launch after jobs/shelter.txt has finished.
+# `bb-pull <run>` fetches another run's files from the results repo; the eval's own output must land in runs/<name>.
+sh_eval: for r in sh_def_d35 sh_def_d22 sh_def_d15 sh_rec_d22 sh_rec_d15; do bb-pull $r && python scripts/snapshot_eval.py runs/$r && mkdir -p runs/sh_eval && cp runs/$r/snap_eval.csv runs/sh_eval/$r.csv; done

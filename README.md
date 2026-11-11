@@ -55,6 +55,11 @@ python scripts/m0.py --episodes 300
 python scripts/replay.py --seed 7 --policy follower --every 2
 ```
 
+Training and evaluation need a GPU and run on rented Vast.ai instances through
+[box-boy](https://github.com/GuerdonL/box-boy): `bb launch jobs/<file>.txt --dry-run` from this checkout.
+`boxboy.toml` holds the image, install command and price limits; results land in a private Hugging Face repo
+and come back with `bb collect`.
+
 ## What M0 taught us about the world
 
 Every one of these was a stall or a bug found by watching episodes, and each is a thing a learned agent will also have to cope with:

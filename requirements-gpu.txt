@@ -1,4 +1,4 @@
-# Pinned to what M1 was trained with (RTX 4090, CUDA 12 wheels). Used by scripts/worker.sh.
+# Pinned to what M1 was trained with (RTX 4090, CUDA 12 wheels). Installed on each rented instance (boxboy.toml: setup).
 jax[cuda12]==0.12.0.1
 flax==0.12.12
 optax==0.2.8

@@ -1,6 +1,7 @@
 # CLAUDE.md — tribe
 
-Read this first. It is the handoff from the session that built M0 and M1.
+Read this first. It is the handoff from the session that built M0 and M1. Since 2026-11-11 the work is driven from a
+small control machine with no GPU; see "Where things run" and the state notes at the end.
 
 ## What this project is
 
@@ -42,9 +43,8 @@ tribe/jax_world.py   the environment (batched JAX). adult_act is the scripted ca
 tribe/model.py       Learner (windowed GTrXL), XLLearner (cached-memory GTrXL: step / sequence), Predictor.
 tribe/train.py       PPO + prediction losses, make_train (window) / make_train_xl, presets, resume, gaze metric.
 tribe/world.py, frame.py, adult.py, policies.py, episode.py   NumPy reference world and M0 (keep in sync with jax_world semantics; tests compare them)
-scripts/m0.py, m0_jax.py, replay.py, vast_setup.sh
-scripts/fleet.py     rent Vast.ai instances, one job per instance (launch / status / logs / collect / destroy)
-scripts/worker.sh, fleet_sync.py   what each instance runs; results go to a private Hugging Face repo
+scripts/m0.py, m0_jax.py, replay.py
+boxboy.toml, jobs/   how box-boy runs this project on rented GPUs, and what to run (see "Where things run")
 scripts/evallib.py + *_eval.py     ablation, word, facing and per-snapshot evaluations of trained weights
 tests/               run `python -m pytest tests -q` (~1 min CPU) after any change
 ```
@@ -82,12 +82,41 @@ Both are now switchable, defaults unchanged (M1): `--warmth-reward deficit` (no 
   hand policies are not a baseline for lethal nights.
 - `jobs/shelter.txt`: reward x night-drain grid, 600 updates each, seed 0. The M1 cell is seeds 1 and 2 on this box.
 
-## Running on several instances
+## Where things run
 
-`python scripts/fleet.py launch jobs/<file>.txt --dry-run` shows the instances and hourly cost; without `--dry-run`
-it asks, then rents. One job per instance, because a run cannot be split across machines and two runs sharing one
-GPU each go at half speed (measured: 3.5 s/update alone, about 8 s/update with two on one 4090). Jobs must write to
-`runs/<name>/`; that folder is uploaded to `<hf user>/tribe-runs` every 10 minutes and restored if the instance
-restarts. Instances destroy themselves on success and stop on failure. The launch commit must be pushed.
-Exercised end to end once (2026-11-10, 20-update smoke job on a rented 4090: clone, install, train at about
-4 s/update, upload, self-destroy with the instance's own key). Restore-after-restart and the failure path (stop) are untested.
+There is no GPU on the control machine. Training and evaluation run on rented Vast.ai instances through
+**box-boy** (`github.com/GuerdonL/box-boy`, a separate repo; its README has the setup, its CLAUDE.md the internals).
+This repo only holds `boxboy.toml` (image, install command, GPU check, price limits) and the jobs files in `jobs/`.
+
+```
+bb doctor                              # logins, config, commit pushed
+bb launch jobs/<file>.txt --dry-run    # instances and hourly cost, rents nothing
+bb launch jobs/<file>.txt              # asks, then rents: one instance per job
+bb status | bb logs <name> | bb wait && bb collect
+```
+
+- One job per instance: a run cannot be split across machines, and two runs on one GPU each go at half speed
+  (measured: 3.5 s/update alone, about 8 s/update with two on one 4090).
+- A job must write to `runs/<name>/`. That folder is uploaded to the private Hugging Face repo `GuerdonL/tribe-runs`
+  every 10 minutes and at the end, and restored if the job is launched again (`--resume` then continues).
+- Instances clone this repo at the commit you launch from, so commit and push first. The repo must stay public.
+- Evaluation scripts need a GPU too: run them as jobs. `bb-pull <run>` inside a job fetches another run's files
+  (see `jobs/shelter_eval.txt`).
+- `bb collect <name>` downloads results into `runs/`. Everything from the first GPU box is in `tribe-runs` as well
+  (`m1_gpu_xl`, `m1_gpu_xl_s1`, `m1_gpu_xl_s2`, `m1_lr_ctl`, `m1_lr_low`); `train.log` in each is the console output.
+- Renting spends money. Show the owner the dry run and get a yes before a launch he has not already approved.
+- On the control machine: `pip install -e ".[dev]"` (CPU JAX) and `JAX_PLATFORMS=cpu python -m pytest tests -q`.
+
+## State at the move to the control machine (2026-11-11)
+
+- **Seeds 1 and 2** (`m1_gpu_xl_s1`, `_s2`) were still training on the first GPU box, due about 05:40 UTC. A script
+  there uploads them to `tribe-runs`, runs `scripts/snapshot_eval.py` on both when they finish and uploads
+  `snap_eval.csv`. If `STATUS.json` is missing from those folders, that did not complete: the snapshots that were
+  uploaded can be evaluated with a job like `jobs/shelter_eval.txt`.
+- **Still open from M1:** does the late pattern of seed 0 repeat on seeds 1 and 2 (following the adult's facing only
+  on "food"/"water"; deaths rise sharply with the adult hidden)? Read it from the two `snap_eval.csv` files
+  (`flip_fw` against `flip_home`, and the `dgap_no_*` columns).
+- **Learning-rate branches** (300 updates from seed 0's final weights, one seed): lr 6.7e-5 against 2e-4 gave
+  deaths per update 3.5 against 7.9, clip fraction 0.20 against 0.38, gaze gap +0.059 against +0.083. A lead, not a result.
+- **Shelter grid** (`jobs/shelter.txt`, then `jobs/shelter_eval.txt`): written and dry-run, **never launched**.
+  It is the next experiment: which of the warmth reward and the harmless night stops sheltering.
