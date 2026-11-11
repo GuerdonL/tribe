@@ -28,7 +28,7 @@ function s(tag, attrs, text) {
 // ------------------------------------------------------------------ state ---
 const S = {
   index: null, worlds: null, terrain: [], field: {},
-  runColor: new Map(), hidden: new Set(), metric: null, model: null,
+  runColor: new Map(), slot: new Map(), known: new Set(), hidden: new Set(), metric: null, model: null, built: 0, builtText: '',
   logs: new Map(), eps: new Map(),
   tracks: [], focus: 0, mode: 'single', t: 0, playing: false, addMode: false, last: 0,
 };
@@ -158,7 +158,7 @@ function renderLegend() {
   for (const r of S.index.runs) {
     const n = S.index.models.filter((m) => m.run === r.name).length;
     const item = h('button', { type: 'button', class: 'item' + (S.hidden.has(r.name) ? ' off' : ''), 'aria-pressed': String(!S.hidden.has(r.name)),
-      title: 'Show or hide this run', onclick: () => { S.hidden.has(r.name) ? S.hidden.delete(r.name) : S.hidden.add(r.name); renderAll(); } },
+      title: 'Show or hide this run', onclick: () => { S.hidden.has(r.name) ? S.hidden.delete(r.name) : S.hidden.add(r.name); assignColors(); renderAll(); } },
       h('span', { class: 'key', style: `border-color:${S.runColor.get(r.name)}` }), r.name,
       h('span', { class: 'n' }, `${n} model${n === 1 ? '' : 's'}${r.finished ? '' : r.has_log ? ', running or unfinished' : ''}`));
     box.append(item);
@@ -716,6 +716,12 @@ async function pollLive() {
     }
     for (const k of [...LIVE.runs.keys()]) if (!seen.has(k)) { LIVE.runs.delete(k); changed = true; }
     LIVE.error = d.error;
+    // the server records a run's models as soon as it ends; when that build lands, take the new data in place
+    if (d.build) {
+      $('#built').textContent = d.build.running ? `${S.builtText} \u00b7 recording new models (${d.build.why})\u2026` : S.builtText;
+      if (S.built && d.build.built > S.built + 0.5) { S.built = d.build.built; await applyIndex(); }
+      else if (!S.built) S.built = d.build.built;
+    }
     if (changed) { if (LIVE.hover) LIVE.dirty = true; else renderLive(); }
     if (![...LIVE.runs.values()].some((r) => r.state !== 'ended')) delay = 20000;
   } catch (e) { delay = 15000; }
@@ -836,25 +842,39 @@ function togglePlay() {
 }
 function stepBy(d) { S.playing = false; $('#btnPlay').textContent = 'Play'; S.t = Math.max(0, Math.min(maxSteps() - 1, Math.floor(S.t) + d)); }
 
-async function init() {
+/* Colour follows the run for as long as it is shown. There are eight colours: a visible run takes the lowest
+   free one and keeps it; hiding a run frees its colour for a run that has none (those are grey meanwhile). */
+function assignColors() {
+  for (const [name] of [...S.slot]) if (S.hidden.has(name) || !S.index.runs.some((r) => r.name === name)) S.slot.delete(name);
+  for (const r of S.index.runs) {
+    if (S.hidden.has(r.name) || S.slot.has(r.name)) continue;
+    const used = new Set(S.slot.values());
+    for (let k = 1; k <= 8; k++) if (!used.has(k)) { S.slot.set(r.name, k); break; }
+  }
+  for (const r of S.index.runs) S.runColor.set(r.name, S.slot.has(r.name) ? cssVar(`--series-${S.slot.get(r.name)}`) : cssVar('--other'));
+}
+
+/* Load (or load again, after the server rebuilt the data) the index and the maps, keeping what is selected. */
+async function applyIndex() {
   const [index, worlds] = await Promise.all([getJSON('data/index.json'), getJSON('data/worlds.json')]);
+  const first = !S.index;
   S.index = index; S.worlds = worlds;
   S.terrain = worlds.worlds.map((w) => b64bytes(w.terrain));
   index.fields.forEach((f, i) => { S.field[f] = i; });
-  $('#built').textContent = `${index.models.length} models in ${index.runs.length} runs · data built ${index.built_utc.replace('T', ' ').replace('Z', ' UTC')}`;
-
-  // colour follows the run: the first eight non-smoke runs take the eight slots in order, the rest are grey
-  let slot = 0;
+  S.builtText = `${index.models.length} models in ${index.runs.length} runs \u00b7 data built ${index.built_utc.replace('T', ' ').replace('Z', ' UTC')}`;
+  $('#built').textContent = S.builtText;
   for (const r of index.runs) {
-    const smoke = r.name.startsWith('smoke');
-    if (smoke) S.hidden.add(r.name);
-    S.runColor.set(r.name, !smoke && slot < 8 ? cssVar(`--series-${++slot}`) : cssVar('--other'));
+    if (!S.known.has(r.name) && r.name.startsWith('smoke')) S.hidden.add(r.name);     // smoke tests start hidden
+    S.known.add(r.name);
   }
+  assignColors();
+  S.logs.clear(); S.eps.clear();
 
   const keys = new Set();
   for (const m of index.models) for (const k of Object.keys(m.stats)) keys.add(k);
   const sel = $('#metric');
-  for (const [pre, title] of [['train_', 'Training log (mean of the 10 updates before each snapshot)'], ['ep_', 'From each model’s 32 recorded episodes'], ['eval_', 'Snapshot evaluation (scripts/snapshot_eval.py, 2048 episodes per model)']]) {
+  sel.replaceChildren();
+  for (const [pre, title] of [['train_', 'Training log (mean of the 10 updates before each snapshot)'], ['ep_', 'From each model\u2019s 32 recorded episodes'], ['eval_', 'Snapshot evaluation (scripts/snapshot_eval.py, 2048 episodes per model)']]) {
     const ks = [...keys].filter((k) => k.startsWith(pre));
     if (!ks.length) continue;
     const g = h('optgroup', { label: title });
@@ -862,8 +882,17 @@ async function init() {
     for (const k of ks) g.append(h('option', { value: k }, label(k)));
     sel.append(g);
   }
-  S.metric = keys.has('train_gaze_gap') ? 'train_gaze_gap' : keys.has('ep_steps') ? 'ep_steps' : [...keys][0];
+  if (!S.metric || !keys.has(S.metric)) S.metric = keys.has('train_gaze_gap') ? 'train_gaze_gap' : keys.has('ep_steps') ? 'ep_steps' : [...keys][0];
   sel.value = S.metric;
+  if (!first) {
+    if (S.model) S.model = modelById(S.model.id) || null;
+    renderAll();
+  }
+}
+
+async function init() {
+  await applyIndex();
+  const index = S.index, sel = $('#metric');
   sel.addEventListener('change', () => { S.metric = sel.value; renderA(); renderB(); renderTable(); });
   $('#smooth').addEventListener('change', renderA);
   $('#logx').addEventListener('change', renderA);
@@ -899,7 +928,7 @@ async function init() {
     start = [...shown].sort((a, b) => count(b.run) - count(a.run) || a.run.localeCompare(b.run) || b.update - a.update)[0] || index.models[index.models.length - 1];
   }
   if (start) {
-    if (S.hidden.has(start.run)) S.hidden.delete(start.run);
+    if (S.hidden.has(start.run)) { S.hidden.delete(start.run); assignColors(); }
     S.model = start;
     renderAll();
     const w = Math.max(0, Math.min(index.n_worlds - 1, Number(hash.get('w')) || 0));

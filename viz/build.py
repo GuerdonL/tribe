@@ -18,6 +18,7 @@ Writes viz/data/ (git-ignored):
 import argparse
 import base64
 import csv
+import fcntl
 import json
 import os
 import sys
@@ -247,6 +248,17 @@ def train_stats(log, update, window=10):
     return out
 
 
+def saved_meta(ep_path):
+    """The model description stored inside a recording, if it was made by this version of the recorder."""
+    try:
+        meta = json.load(open(ep_path)).get("meta")
+    except (OSError, ValueError):
+        return None
+    if not meta or meta.get("v") != VERSION or meta.get("n_worlds") != N_WORLDS:
+        return None
+    return {k: v for k, v in meta.items() if k not in ("v", "n_worlds")}
+
+
 # ----------------------------------------------------------------- main ---
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -255,7 +267,16 @@ def main():
     ap.add_argument("--only", nargs="*", default=None, help="run names to build")
     ap.add_argument("--limit", type=int, default=None, help="record at most this many new models, then stop")
     ap.add_argument("--force", action="store_true", help="record again even if unchanged")
+    ap.add_argument("--wait", action="store_true", help="if another build is running, wait for it instead of leaving")
     a = ap.parse_args()
+    # one build at a time (the timer and the server both start builds)
+    os.makedirs(DATA, exist_ok=True)
+    lock = open(os.path.join(DATA, ".build.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if a.wait else fcntl.LOCK_NB))
+    except BlockingIOError:
+        print("another build is running; leaving it to finish")
+        return
     repo = None if a.offline else a.repo
     t0 = time.time()
 
@@ -307,8 +328,8 @@ def main():
                 continue                                   # the final weights are also a snapshot
             snap_updates.add(update)
             mid = f"{run}@final" if final else f"{run}@u{update:05d}"
-            m = old.get(mid)
             ep_path = os.path.join(DATA, "ep", f"{mid}.json")
+            m = old.get(mid) or saved_meta(ep_path)        # the second: recorded by a build that was cancelled
             fresh = m and m.get("sha") == files[rel] and os.path.exists(ep_path) and not a.force
             if not fresh:
                 if a.limit is not None and new >= a.limit:
@@ -320,13 +341,14 @@ def main():
                     write_json(os.path.join(DATA, "worlds.json"), rec.worlds())
                 t1 = time.time()
                 cfg, eps = rec.record(fetch(repo, run, rel))
-                write_json(ep_path, dict(id=mid, fields=FIELDS, episodes=eps))
                 m = dict(id=mid, run=run, final=final, sha=files[rel], stats=model_stats(eps, rec.S),
                          episodes=[{k: v for k, v in e.items() if k not in ("data", "actions")} for e in eps],
                          world=dict(night_drain=clean(getattr(cfg, "night_drain", 1 / 35)),
                                     warmth_reward=getattr(cfg, "warmth_reward", "recover"),
                                     predator_move_every=int(getattr(cfg, "predator_move_every", 2))),
                          seed=int(getattr(cfg, "seed", 0)), lr=clean(getattr(cfg, "lr", 0)))
+                # the recording carries its own description, so a build stopped before index.json keeps it
+                write_json(ep_path, dict(id=mid, fields=FIELDS, episodes=eps, meta=dict(m, v=VERSION, n_worlds=N_WORLDS)))
                 new += 1
                 print(f"recorded {mid}: mean {m['stats']['ep_steps']:.0f} steps, "
                       f"{100 * m['stats']['ep_survived']:.0f}% survived ({time.time() - t1:.0f} s)", flush=True)

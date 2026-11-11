@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tomllib
@@ -112,7 +113,38 @@ class Live:
             self.hf_repo = tomllib.load(open(os.path.join(ROOT, "boxboy.toml"), "rb")).get("hf_repo")
         except (OSError, ValueError):
             pass
+        self.build = None                # the running `build.py` process, if any
+        self.build_why = ""
+        self.build_lock = threading.Lock()
         self._load()
+
+    # ------------------------------------------------------------ build ---
+    def trigger_build(self, why):
+        """A run ended: record its models now. A build already in progress is cancelled and restarted, so the
+        newest results are never queued behind an older pass (finished recordings are kept either way)."""
+        with self.build_lock:
+            if self.build is not None and self.build.poll() is None:
+                self.build.terminate()
+                try:
+                    self.build.wait(15)
+                except subprocess.TimeoutExpired:
+                    self.build.kill()
+                    self.build.wait(5)
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            log = open(os.path.join(os.path.dirname(STATE_FILE), "build.log"), "a")
+            log.write(f"\n--- {time.strftime('%FT%TZ', time.gmtime())} build started: {why}\n")
+            log.flush()
+            self.build = subprocess.Popen([sys.executable, os.path.join(HERE, "build.py"), "--wait"], cwd=ROOT,
+                                          stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            self.build_why = why
+
+    def build_state(self):
+        try:
+            built = os.path.getmtime(os.path.join(HERE, "data", "index.json"))
+        except OSError:
+            built = 0
+        running = self.build is not None and self.build.poll() is None
+        return dict(running=running, why=self.build_why if running else "", built=built)
 
     # ------------------------------------------------------------ state ---
     def _load(self):
@@ -139,7 +171,8 @@ class Live:
         """What the page asks for. `have` is {run name: rows it already has}."""
         with self.lock:
             runs = [r.public(min(max(int(have.get(r.name, 0)), 0), len(r.rows))) for r in sorted(self.runs.values(), key=lambda r: r.name)]
-            return dict(t=time.time(), error=self.error, project=self.project, poll_s=POLL_EVERY_S, runs=runs)
+            return dict(t=time.time(), error=self.error, project=self.project, poll_s=POLL_EVERY_S, runs=runs,
+                        build=self.build_state())
 
     # ---------------------------------------------------------- polling ---
     def _sh(self, args, timeout):
@@ -163,6 +196,7 @@ class Live:
         prefix = self.project + ":"
         planned = planned_updates()
         seen = set()
+        ended = []                                             # runs that ended since the last listing
         with self.lock:
             for i in rows:
                 label = i.get("label") or ""
@@ -181,6 +215,8 @@ class Live:
                 r.ended_t = None
                 actual = i.get("actual_status")
                 if i.get("intended_status") == "stopped" or actual in ("exited", "stopped", "offline"):
+                    if r.state != "ended":
+                        ended.append(name)
                     r.state, r.detail = "ended", "instance stopped: the job failed or hit its time limit (bb logs, then bb destroy)"
                     r.ended_t = r.ended_t or time.time()
                 elif actual != "running":
@@ -189,11 +225,14 @@ class Live:
                     r.state, r.detail = "setup", "installing dependencies and compiling"
             for name, r in self.runs.items():
                 if name not in seen and r.state != "ended":
+                    ended.append(name)
                     r.state, r.ended_t = "ended", time.time()
                     done = r.total and len(r.rows) >= r.total
                     r.detail = "finished; the instance destroyed itself" if done else "the instance is gone"
             for name in [n for n, r in self.runs.items() if r.ended_t and time.time() - r.ended_t > KEEP_ENDED_S]:
                 del self.runs[name]
+        if ended:
+            self.trigger_build("ended: " + ", ".join(sorted(ended)))
 
     def _fetch(self, r):
         if r.ssh is None:
