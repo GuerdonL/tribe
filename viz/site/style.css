@@ -138,3 +138,13 @@ label.check { gap: 4px; }
 .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #0ca30c; margin-right: 6px; animation: pulse 1.6s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.25; } }
 @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+
+/* model picker: one titled group per run, one button per saved update */
+.picker { display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow: auto; padding-right: 2px; }
+.picker .group { border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+.picker .group.off { opacity: 0.6; }
+.picker .title { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-weight: 600; font-size: 13px; }
+.picker .title .about { font-weight: 400; color: var(--text-2); font-size: 12px; }
+.picker .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.picker .chips button { padding: 2px 8px; font-size: 12.5px; font-variant-numeric: tabular-nums; border-radius: 999px; }
+.picker .chips button.sel { background: var(--text); color: var(--surface); border-color: var(--text); }

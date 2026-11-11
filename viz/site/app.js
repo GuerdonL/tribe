@@ -369,6 +369,29 @@ function renderTable() {
     h('th', { class: 'num' }, label(metric)), h('th', { class: 'num' }, 'Mean steps'), h('th', { class: 'num' }, 'Survived'))), tb));
 }
 
+// ----------------------------------------------------------------- picker ---
+function renderPicker() {
+  const box = $('#picker');
+  box.replaceChildren();
+  for (const r of S.index.runs) {
+    const ms = S.index.models.filter((m) => m.run === r.name).sort((a, b) => a.update - b.update);
+    if (!ms.length) continue;
+    const w = ms[0].world, drain = w.night_drain ? `1/${Math.round(1 / w.night_drain)}` : '?';
+    const chips = h('div', { class: 'chips', role: 'group', 'aria-label': `Saved updates of ${r.name}` });
+    for (const m of ms) {
+      chips.append(h('button', { type: 'button', class: S.model && S.model.id === m.id ? 'sel' : '', 'aria-pressed': String(!!(S.model && S.model.id === m.id)),
+        title: `${modelLabel(m)}: survived ${fmt(m.stats.ep_survived, 'ep_survived')} of 32 episodes, ${fmt(m.stats.ep_steps)} steps on average`,
+        onclick: () => selectModel(m.id) }, `${m.update}${m.final ? ' (latest)' : ''}`));
+    }
+    box.append(h('div', { class: 'group' + (S.hidden.has(r.name) ? ' off' : '') },
+      h('div', { class: 'title' }, h('span', { class: 'key', style: `border-color:${S.runColor.get(r.name)}` }), r.name,
+        h('span', { class: 'about' }, `seed ${ms[0].seed} \u00b7 warmth reward "${w.warmth_reward}" \u00b7 night drain ${drain} \u00b7 ${ms.length} saved update${ms.length === 1 ? '' : 's'}${S.hidden.has(r.name) ? ' \u00b7 hidden in the charts' : ''}`)),
+      chips));
+  }
+  const sel = box.querySelector('button.sel');
+  if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: 'nearest' });
+}
+
 // ------------------------------------------------------------- model card ---
 function renderModel() {
   const m = S.model;
@@ -829,7 +852,7 @@ function liveChart(box, metric, series) {
 }
 
 // ------------------------------------------------------------------- wire ---
-function renderAll() { renderLegend(); renderA(); renderB(); renderTable(); renderModel(); }
+function renderAll() { renderLegend(); renderA(); renderB(); renderTable(); renderPicker(); renderModel(); }
 function sizeCanvas() {
   const cv = $('#map'), w = Math.round(cv.clientWidth * Math.min(2, devicePixelRatio || 1));
   if (w && cv.width !== w) { cv.width = w; cv.height = w; }
