@@ -47,6 +47,7 @@ scripts/m0.py, m0_jax.py, replay.py
 boxboy.toml, jobs/   how box-boy runs this project on rented GPUs, and what to run (see "Where things run")
 scripts/evallib.py + *_eval.py     ablation, word, facing and per-snapshot evaluations of trained weights
 tests/               run `python -m pytest tests -q` (~1 min CPU) after any change
+viz/                 website for the runs: build.py records 32 episodes per saved model on CPU, serve.py hosts it (viz/README.md)
 ```
 
 ## Conventions

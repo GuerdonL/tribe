@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tribe runs</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>tribe <span class="sub">training runs</span></h1>
+  <span id="built" class="muted"></span>
+</header>
+
+<main>
+  <section class="col" aria-label="Models and metrics">
+    <div class="filters">
+      <label>Metric <select id="metric"></select></label>
+      <label>Smoothing <select id="smooth">
+        <option value="1">none</option><option value="10">10 updates</option>
+        <option value="25" selected>25 updates</option><option value="100">100 updates</option>
+      </select></label>
+      <label class="check"><input type="checkbox" id="logx" checked> log update axis</label>
+    </div>
+    <div id="legend" class="legend" aria-label="Runs"></div>
+
+    <div class="card">
+      <h2 id="titleA">Over training</h2>
+      <p class="hint">Each dot is a saved model. Click one to select it.</p>
+      <div id="chartA" class="chart"></div>
+    </div>
+
+    <div class="card">
+      <h2 id="titleB">Distribution across models</h2>
+      <p class="hint">One dot per saved model, stacked where values are close. Click one to select it.</p>
+      <div id="chartB" class="chart"></div>
+    </div>
+
+    <details class="card" id="tableCard">
+      <summary>Table of models</summary>
+      <div id="table" class="tablewrap"></div>
+    </details>
+  </section>
+
+  <section class="col" aria-label="Selected model and playback">
+    <div class="card" id="modelCard">
+      <h2 id="modelTitle">No model selected</h2>
+      <p id="modelSub" class="hint"></p>
+      <div id="tiles" class="tiles"></div>
+      <h3>Its 32 episodes, by steps survived</h3>
+      <p class="hint">Every model plays the same 32 worlds. Click a dot to play that episode.</p>
+      <div id="epLegend" class="legend small"></div>
+      <div id="chartE" class="chart"></div>
+      <div class="buttons">
+        <button id="btnWorlds" type="button">Superimpose all 32 episodes</button>
+        <button id="btnSnaps" type="button">Same world across this run's training</button>
+        <button id="btnAdd" type="button">Add next clicked episode to the map</button>
+      </div>
+      <details>
+        <summary>Table of episodes</summary>
+        <div id="epTable" class="tablewrap"></div>
+      </details>
+      <details>
+        <summary>All statistics for this model</summary>
+        <div id="statTable" class="tablewrap"></div>
+      </details>
+    </div>
+
+    <div class="card" id="playerCard">
+      <h2 id="playTitle">Playback</h2>
+      <p id="playNote" class="hint"></p>
+      <div class="stage">
+        <canvas id="map" width="640" height="640" aria-label="Top-down map of the episode"></canvas>
+      </div>
+      <div class="controls">
+        <button id="btnBack" type="button" title="One step back (left arrow)" aria-label="One step back">&#9664;&#9664;</button>
+        <button id="btnPlay" type="button" class="primary" title="Play or pause (space)">Play</button>
+        <button id="btnFwd" type="button" title="One step forward (right arrow)" aria-label="One step forward">&#9654;&#9654;</button>
+        <input id="scrub" type="range" min="0" max="319" value="0" step="1" aria-label="Step">
+        <span id="stepLabel" class="num">0 / 0</span>
+      </div>
+      <div class="controls">
+        <label class="grow">Speed
+          <input id="speed" type="range" min="0" max="100" value="45" step="1" aria-label="Playback speed, log scale">
+        </label>
+        <span id="speedLabel" class="num"></span>
+        <label class="check"><input type="checkbox" id="follow"> follow agent</label>
+        <label class="check"><input type="checkbox" id="cone" checked> view cone</label>
+        <label class="check"><input type="checkbox" id="trails" checked> trails</label>
+      </div>
+      <div id="hud" class="hud"></div>
+      <div id="tracks" class="tracks" aria-label="Agents on the map"></div>
+      <div id="mapKey" class="legend small"></div>
+    </div>
+  </section>
+</main>
+
+<div id="tip" class="tip" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
