@@ -13,7 +13,7 @@ Owner: Guerdon (GuerdonL on GitHub). He wants to move fast and prefers decisions
 
 - **M0 passed** (hand-written policies, no model): gaze-following learner outlives gaze-ignoring one, +37.5 steps over 300 paired episodes, 95% CI [+27.7, +47.3]. Reproduced in the JAX world (+33.6, CI [+20.6, +46.3]).
 - **M1 passed** (2026-11-10, branch `xl-memory`, `--preset gpu_xl`, 3000 updates / 393M steps in 2.9 h on a 4090; log `runs/m1_gpu_xl/log.csv`, weights `params.pkl`). `gaze_follow_rate` was above `gaze_chance` in every one of the last 500 updates (gap +0.071, per-update sd 0.011). Causal check (`scripts/gaze_eval.py`, 41k cue steps): flipping only the adult's observed facing, same memory, shifts the matching-turn preference by +0.11 / +0.12 (95% CIs +0.106..+0.116 and +0.117..+0.128). Facing predicts the turn within every adult-position stratum, so it is not "turn toward the adult".
-- **Open question from M1:** the gap peaked at +0.23 around updates 200-300 and settled near +0.05..+0.07, while deaths per update fell 124 -> 7. Likely the learner leans on the adult less as it survives on its own; not tested. If M2 needs strong reliance on adults, this is the thing to look at (reward pressure, or cue value in harder worlds).
+- **The M1 fade, answered (2026-11-12, `notes/shelter.md`):** the gap peaked at +0.23 around updates 200-300 and settled near +0.05..+0.07, while deaths per update fell 124 -> 7. It is a narrowing, not independence: on all three seeds the final learner follows the adult's facing on "food"/"water" (+0.35..+0.47) and not on "home" (about 0), and 65-69% die with the adult hidden against 2-3% with it. Nights that cost something keep "home" followed (see the shelter grid).
 - Checkpoints pickle `cfg` as `__main__.TrainConfig` (training runs with `-m`); scripts that load them alias it (see `scripts/gaze_eval.py`).
 - **Why not `--preset gpu`:** the windowed learner fits (37 GB with remat) but re-encodes a K=32 window for every rollout step and every training sample, about 120 s/update (about 100 h for 3000). It was stopped at update 11; its partial log is in `runs/m1_gpu/`. `arch="xl"` (`XLLearner`, `make_train_xl`) caches per-layer memory in the rollout and runs each env's segment once in training; `tests/test_train_xl.py` checks the training pass reproduces rollout log-probs exactly. Position is a relative bias, not absolute-in-window, so the two architectures are not checkpoint-compatible.
 - CPU smoke run (300k params, 150k steps) trained stably: world CE 52 -> 19, heard CE 4.7 -> 0.7, gaze metric at chance. That only proves the plumbing.
@@ -46,6 +46,8 @@ tribe/world.py, frame.py, adult.py, policies.py, episode.py   NumPy reference wo
 scripts/m0.py, m0_jax.py, replay.py
 boxboy.toml, jobs/   how box-boy runs this project on rented GPUs, and what to run (see "Where things run")
 scripts/evallib.py + *_eval.py     ablation, word, facing and per-snapshot evaluations of trained weights
+scripts/shelter_measure.py, dusk_distance.py   sheltering with intervals (CPU); distance from the shelter at dusk against outcome
+notes/               m1.md, shelter.md: results and open questions, one file per experiment
 tests/               run `python -m pytest tests -q` (~1 min CPU) after any change
 viz/                 website for the runs: build.py records 32 episodes per saved model on CPU, serve.py hosts it (viz/README.md)
 ```
@@ -70,7 +72,7 @@ Fix before any M2 training:
   learner stays at full warmth and gets none of it. Pay for deficit avoided, not recovery.
 - **Nights are harmless.** Seed-0 final weights: sheltered on 0.0% of night steps, zero cold deaths, 0.2% predator
   deaths. A night drains 0.57 warmth from 1.0 and the predator starts too far away to arrive. The shelter rung
-  needs nights that cost something. Whether the reward term or the harmless night is what stops sheltering is untested.
+  needs nights that cost something. Answered by the shelter grid: the reward term (see below).
 - Consequence: "home" and "here" are ignored by the learner, and the adult says "home" about 40% of each day.
 
 Both are now switchable, defaults unchanged (M1): `--warmth-reward deficit` (no pay for regained warmth; charge
@@ -81,7 +83,18 @@ Both are now switchable, defaults unchanged (M1): `--warmth-reward deficit` (no 
   At 1/15 there are 12 dusk + 15 night steps to get there, so it is reachable for most, not all.
 - The hand-written follower does not manage it (96% cold deaths at 1/15, sheltered 24% of night steps), so M0-style
   hand policies are not a baseline for lethal nights.
-- `jobs/shelter.txt`: reward x night-drain grid, 600 updates each, seed 0. The M1 cell is seeds 1 and 2 on this box.
+- `jobs/shelter.txt`: reward x night-drain grid, 600 updates each, seed 0. The M1 cell is seeds 1 and 2.
+
+**Shelter grid result (2026-11-11/12, `notes/shelter.md`, one seed per cell):**
+- Under the M1 `recover` reward the learner never shelters at 1/35 or 1/22. Under `deficit` it does, even at 1/35
+  (in the shelter when night starts in 23% of episodes; 30% at 1/22).
+- `deficit` x 1/22 is the only survivable cell that keeps the learner following "home" (flip +0.27) and has the
+  lowest death rate (6.9%). It is the candidate world for M2.
+- Lethal nights (1/15) are not solved in 600 updates (74-77% die). Deaths are decided by distance at dusk: from 17+
+  steps away 4-5% reach the shelter, because the adult only says "home" from dusk start (26 steps left) and the
+  learner closes about 0.3-0.4 steps of distance per step. The maps themselves are all solvable.
+- Decided 2026-11-12: no distance-aware "home" call and no further tuning of the adult. Next is M2. (A model adult
+  that chooses among the script's intents, words still scripted, was discussed and is not planned.)
 
 ## Where things run
 
@@ -108,16 +121,15 @@ bb status | bb logs <name> | bb wait && bb collect
 - Renting spends money. Show the owner the dry run and get a yes before a launch he has not already approved.
 - On the control machine: `pip install -e ".[dev]"` (CPU JAX) and `JAX_PLATFORMS=cpu python -m pytest tests -q`.
 
-## State at the move to the control machine (2026-11-11)
+## State (2026-11-12)
 
-- **Seeds 1 and 2** (`m1_gpu_xl_s1`, `_s2`) were still training on the first GPU box, due about 05:40 UTC. A script
-  there uploads them to `tribe-runs`, runs `scripts/snapshot_eval.py` on both when they finish and uploads
-  `snap_eval.csv`. If `STATUS.json` is missing from those folders, that did not complete: the snapshots that were
-  uploaded can be evaluated with a job like `jobs/shelter_eval.txt`.
-- **Still open from M1:** does the late pattern of seed 0 repeat on seeds 1 and 2 (following the adult's facing only
-  on "food"/"water"; deaths rise sharply with the adult hidden)? Read it from the two `snap_eval.csv` files
-  (`flip_fw` against `flip_home`, and the `dgap_no_*` columns).
+- **Nothing is rented.** The first GPU box was destroyed on 2026-11-11 after seeds 1 and 2 were confirmed uploaded.
+- **Seeds 1 and 2** (`m1_gpu_xl_s1`, `_s2`) finished 3000 updates; snapshots and `snap_eval.csv` are in `tribe-runs`.
+- **Shelter grid and its evaluation are done** (`sh_rec_d22`, `sh_rec_d15`, `sh_def_d35`, `sh_def_d22`, `sh_def_d15`;
+  `notes/shelter.md`).
+- **The visualizer is hosted on the control machine** (systemd user service `tribe-viz`, port 8080, login in
+  `~/.config/tribe-viz/auth`). It records each run's models when the run ends and shows running jobs live.
 - **Learning-rate branches** (300 updates from seed 0's final weights, one seed): lr 6.7e-5 against 2e-4 gave
   deaths per update 3.5 against 7.9, clip fraction 0.20 against 0.38, gaze gap +0.059 against +0.083. A lead, not a result.
-- **Shelter grid** (`jobs/shelter.txt`, then `jobs/shelter_eval.txt`): written and dry-run, **never launched**.
-  It is the next experiment: which of the warmth reward and the harmless night stops sheltering.
+- **Next is M2** (several learners with shared weights in the survival world). Its design is being discussed; the
+  open worry is how often learners see each other at all.
